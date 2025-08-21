@@ -271,7 +271,7 @@ ploi@PhuocLoiiiii:~/pwn/ROP/make-rop-great-again/make-rop-great-again$ checksec 
 
 - đây là hàm main của bài , ta có thể thấy được 1 bug ```BOF``` rất dễ dàng và canary cũng không được bật ở đây
 
-```C
+```c
 int __fastcall main(int argc, const char **argv, const char **envp)
 {
   _BYTE v4[16]; // [rsp+0h] [rbp-10h] BYREF
@@ -283,7 +283,7 @@ int __fastcall main(int argc, const char **argv, const char **envp)
 ```
 - show_prompt 
 
-```C
+```c
 int show_prompt()
 {
   return puts(">");
