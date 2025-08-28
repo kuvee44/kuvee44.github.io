@@ -18,9 +18,9 @@ export const NAV_LINKS: SocialLink[] = [
 ]
 
 export const SOCIAL_LINKS: SocialLink[] = [
-  { href: 'https://github.com/jktrn', label: 'GitHub' },
-  { href: 'https://twitter.com/enscry', label: 'Twitter' },
-  { href: 'mailto:tranphuocloi.hp18@gmail.com', label: 'Email' }, // sửa ở đây
+  { href: 'https://github.com/kuvee44', label: 'GitHub' },
+  { href: 'https://twitter.com/kuvee44', label: 'Twitter' },
+  { href: 'mailto:kuvee44@gmail.com', label: 'Email' },
   { href: '/rss.xml', label: 'RSS' },
 ]
 

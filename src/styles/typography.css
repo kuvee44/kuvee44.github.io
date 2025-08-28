@@ -62,7 +62,8 @@
     }
 
     :where(a):not(:where([class~='not-prose'], [class~='not-prose'] *)) {
-      @apply text-foreground decoration-muted-foreground hover:decoration-foreground font-medium break-words underline underline-offset-[3px] transition-colors;
+      @apply text-primary decoration-primary/30 hover:decoration-primary font-medium break-words underline underline-offset-[4px] transition-colors;
+      text-decoration-thickness: .08em;
     }
 
     :where(strong):not(:where([class~='not-prose'], [class~='not-prose'] *)) {
@@ -96,7 +97,28 @@
     :where(blockquote):not(
         :where([class~='not-prose'], [class~='not-prose'] *)
       ) {
-      @apply [&_*]:text-muted-foreground small my-6 border-l-2 pl-6;
+      @apply [&_*]:text-muted-foreground small my-6 border-l-4 pl-6;
+      background: linear-gradient(135deg, 
+        color-mix(in oklch, var(--muted) 70%, transparent),
+        color-mix(in oklch, var(--secondary) 30%, transparent)
+      );
+      border-radius: .5rem;
+      padding-block: 1rem;
+      border-left-color: var(--primary);
+      position: relative;
+      box-shadow: 0 2px 10px color-mix(in oklch, var(--foreground) 3%, transparent);
+    }
+    :where(blockquote):not(
+        :where([class~='not-prose'], [class~='not-prose'] *)
+      )::before {
+      content: '"';
+      position: absolute;
+      top: -10px;
+      left: 10px;
+      font-size: 3rem;
+      color: var(--primary);
+      opacity: 0.3;
+      font-family: serif;
     }
 
     :where(hr):not(:where([class~='not-prose'], [class~='not-prose'] *)) {
@@ -132,7 +154,7 @@
     }
 
     :where(pre):not(:where([class~='not-prose'], [class~='not-prose'] *)) {
-      @apply max-h-[min(68vh,1000px)]! overflow-y-auto [&::-webkit-scrollbar-corner]:hidden;
+      @apply max-h-none! h-auto! overflow-y-visible! [&::-webkit-scrollbar-corner]:hidden;
     }
 
     :where(summary):not(:where([class~='not-prose'], [class~='not-prose'] *)) {

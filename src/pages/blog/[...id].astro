@@ -9,6 +9,8 @@ import TOCHeader from '@/components/TOCHeader.astro'
 import TOCSidebar from '@/components/TOCSidebar.astro'
 import { badgeVariants } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import ImageLightbox from '@/components/ImageLightbox.astro'
+import ContentWithLightbox from '@/components/ContentWithLightbox.astro'
 import Layout from '@/layouts/Layout.astro'
 import {
   getAdjacentPosts,
@@ -110,8 +112,8 @@ const tocSections = await getTOCSections(currentPostId)
 
     {
       post.data.image && (
-        <Image
-          src={post.data.image}
+        <ImageLightbox
+          src={post.data.image.src}
           alt={post.data.title}
           width={1200}
           height={630}
@@ -223,9 +225,9 @@ const tocSections = await getTOCSections(currentPostId)
       )
     }
 
-    <article class="prose col-start-2 max-w-none">
+    <ContentWithLightbox class="col-start-2">
       <Content />
-    </article>
+    </ContentWithLightbox>
 
     {
       (hasChildPosts || isCurrentSubpost) && (
