@@ -1,7 +1,7 @@
 --- 
 title: Cross-Cache 
-date: 2025-05-18 00:00:00 +0800
-description: 'zzz'
+date: 2025-11-10 00:00:00 +0800
+description: 'no desc'
 tags: ['pwn','kernel','note']
 authors: ['kuvee']
 draft: false
@@ -67,7 +67,6 @@ for (i = 0; i < num_spray; i += objs_per_slab) {
 
 - tiếp theo chỉ việc spray obj ở cache khác ( tty_operation , seq_operations) , do buddy chứa sẵn nhiều page order-0 mới trả về , khả năng cao cache kia sẽ nhận đúng các trang đó 
 
-![image](https://hackmd.io/_uploads/rJRHO34Tgl.png)
 
 
 ref : https://sam4k.com/linternals-memory-allocators-part-1/  , https://sam4k.com/linternals-memory-allocators-0x02/ , https://r1ru.github.io/posts/1/
@@ -76,7 +75,7 @@ ref : https://sam4k.com/linternals-memory-allocators-part-1/  , https://sam4k.co
 
 ## Exploit 
 
-- ta có thể check các thông tin về slab ở `/proc/slabinfo` 
+- đây là 1 challenge ở `TsukuCTF` ,  ta có thể check các thông tin về slab ở `/proc/slabinfo` 
 
 ```
 ~ # cat /proc/slabinfo
@@ -362,4 +361,6 @@ ref:
 - https://lore.kernel.org/lkml/20210505200610.13943-3-longman@redhat.com/
 - https://ruia-ruia.github.io/2022/08/05/CVE-2022-29582-io-uring/#crossing-the-cache-boundary
 - https://i.blackhat.com/Asia-24/Presentations/Asia-24-Wu-Game-of-Cross-Cache.pdf
+- https://r1ru.github.io/posts/1/
+
 
